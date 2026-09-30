@@ -86,13 +86,13 @@
 <!-- /skill:libraries -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>MOGGED · Арена</title>
+<title>FACEMATCH · Arena</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800;900&family=Onest:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
 
 <!--
-  MOGGED · Арена
+  FACEMATCH · Арена
   ================================================================
   1. Supabase URL и anon public key уже прописаны в CONFIG ниже — файл готов к импорту.
   2. Supabase → SQL Editor: один раз вставь и запусти весь SQL из блока <script id="supabase-sql"> ниже.
@@ -100,11 +100,14 @@
   4. Авторизация хранится через Supabase Session; профиль, ELO, история и матчи сохраняются в БД.
   5. Матчмейкинг работает через mm_tick: оба игрока регулярно проверяют очередь, поэтому они находят друг друга между разными сессиями и сетями.
   6. Для P2P-видео используется WebRTC; при проблемах с P2P бой всё равно может стартовать через Supabase Realtime.
+  7. Бой с другом (вызов по нику и приглашение по ссылке ?c=код): если база уже настроена, достаточно запустить
+     в SQL Editor только блок «вызовы и приглашения» в конце SQL ниже. Он ничего не удаляет и не меняет в старых таблицах.
+  8. Язык интерфейса RU / EN переключается кнопкой в шапке, выбор сохраняется в браузере.
   ================================================================
 -->
 <script type="text/plain" id="supabase-sql">
 
--- MOGGED · схема для Supabase. Можно запускать повторно.
+-- FACEMATCH · схема для Supabase. Можно запускать повторно.
 create extension if not exists pgcrypto;
 
 -- ---------- профили (регистрация сохраняется тут) ----------
@@ -343,6 +346,104 @@ begin
     execute 'alter publication supabase_realtime add table public.matches';
   end if;
 end $$;
+
+-- =====================================================================
+-- ---------- вызовы и приглашения (FACEMATCH: бой с другом) ----------
+-- Только добавляет новое: таблицу challenges и 4 функции. Старые таблицы,
+-- ELO, профили и история не трогаются. Можно запускать повторно.
+-- =====================================================================
+create table if not exists public.challenges (
+  id uuid primary key default gen_random_uuid(),
+  code text not null unique default substr(replace(gen_random_uuid()::text, '-', ''), 1, 12),
+  from_user uuid not null references public.profiles on delete cascade,
+  to_user uuid references public.profiles on delete cascade,
+  ranked boolean not null default false,
+  status text not null default 'pending',
+  match_id uuid references public.matches on delete set null,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default now() + interval '30 minutes'
+);
+create index if not exists challenges_to_idx on public.challenges (to_user, status);
+create index if not exists challenges_from_idx on public.challenges (from_user, status);
+
+alter table public.challenges enable row level security;
+drop policy if exists "challenges_read_own" on public.challenges;
+create policy "challenges_read_own" on public.challenges for select to authenticated
+  using (auth.uid() = from_user or auth.uid() = to_user);
+revoke all on public.challenges from anon;
+revoke insert, update, delete on public.challenges from authenticated;
+grant select on public.challenges to authenticated;
+
+-- создать вызов: по нику (p_username) или открытую ссылку (p_username = null)
+create or replace function public.create_challenge(p_username text default null, p_ranked boolean default false)
+returns public.challenges language plpgsql security definer set search_path = public as $$
+declare me profiles; target uuid; nick text; c challenges;
+begin
+  select * into me from profiles where id = auth.uid();
+  if not found then raise exception 'no profile'; end if;
+  nick := nullif(btrim(ltrim(btrim(coalesce(p_username, '')), '@')), '');
+  if nick is not null then
+    select id into target from profiles where lower(username) = lower(nick);
+    if target is null then raise exception 'user not found'; end if;
+    if target = me.id then raise exception 'self challenge'; end if;
+  end if;
+  -- у одного игрока максимум один активный вызов
+  update challenges set status = 'cancelled' where from_user = me.id and status = 'pending';
+  insert into challenges (from_user, to_user, ranked, expires_at)
+  values (me.id, target, coalesce(p_ranked, false),
+          now() + case when target is null then interval '30 minutes' else interval '3 minutes' end)
+  returning * into c;
+  return c;
+end $$;
+
+-- посмотреть приглашение по коду из ссылки
+create or replace function public.peek_challenge(p_code text)
+returns jsonb language sql stable security definer set search_path = public as $$
+  select jsonb_build_object(
+    'id', c.id, 'code', c.code, 'ranked', c.ranked, 'status', c.status,
+    'expired', c.expires_at < now(),
+    'for_me', (c.to_user is null or c.to_user = auth.uid()),
+    'from', jsonb_build_object('id', p.id, 'display_name', p.display_name, 'username', p.username,
+                               'avatar_url', p.avatar_url, 'elo', p.elo, 'faculty', p.faculty, 'tags', p.tags))
+  from challenges c join profiles p on p.id = c.from_user
+  where c.code = p_code
+  limit 1;
+$$;
+
+-- принять вызов: создаёт обычный матч (дальше работают те же report_result / ELO)
+create or replace function public.accept_challenge(p_code text)
+returns uuid language plpgsql security definer set search_path = public as $$
+declare me profiles; c challenges; host profiles; mid uuid;
+begin
+  select * into me from profiles where id = auth.uid();
+  if not found then raise exception 'no profile'; end if;
+  select * into c from challenges where code = p_code for update;
+  if not found then raise exception 'challenge not found'; end if;
+  if c.status = 'accepted' and c.to_user = me.id and c.match_id is not null then return c.match_id; end if;
+  if c.status <> 'pending' then raise exception 'challenge closed'; end if;
+  if c.expires_at < now() then raise exception 'challenge expired'; end if;
+  if c.from_user = me.id then raise exception 'self challenge'; end if;
+  if c.to_user is not null and c.to_user <> me.id then raise exception 'not for you'; end if;
+  select * into host from profiles where id = c.from_user;
+  insert into matches (player_a, player_b, ranked, elo_a_before, elo_b_before)
+  values (host.id, me.id, c.ranked, host.elo, me.elo) returning id into mid;
+  update challenges set status = 'accepted', to_user = me.id, match_id = mid where id = c.id;
+  delete from queue where user_id in (host.id, me.id);
+  return mid;
+end $$;
+
+-- отклонить (получатель) или отменить (автор)
+create or replace function public.decline_challenge(p_id uuid)
+returns void language sql security definer set search_path = public as $$
+  update challenges
+     set status = case when from_user = auth.uid() then 'cancelled' else 'declined' end
+   where id = p_id and status = 'pending' and auth.uid() in (from_user, to_user);
+$$;
+
+revoke all on function public.create_challenge(text, boolean), public.peek_challenge(text),
+  public.accept_challenge(text), public.decline_challenge(uuid) from public, anon;
+grant execute on function public.create_challenge(text, boolean), public.peek_challenge(text),
+  public.accept_challenge(text), public.decline_challenge(uuid) to authenticated;
 
 </script>
 
@@ -799,6 +900,29 @@ button.launch:active{transform:scale(.995)}
 @keyframes toastOut{to{opacity:0;transform:translateX(-16px)}}
 #fx{position:fixed;inset:0;pointer-events:none;z-index:var(--z-fx);width:100%;height:100%}
 
+/* ---------- friend battles / language ---------- */
+.lang svg{width:16px;height:16px}
+.auth-form-wrap{position:relative}
+.duo{display:grid;gap:var(--sp-sm);padding:var(--sp-lg);border:1px solid var(--line-soft);background:var(--s1)}
+.duo-head{display:flex;justify-content:space-between;align-items:baseline;gap:var(--sp-md);flex-wrap:wrap}
+.duo-head small{color:var(--tx3);font-size:.8rem}
+.duo-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:var(--sp-xs)}
+.duo-row .btn{margin:0}
+.duo-acts{display:flex;gap:var(--sp-xs) var(--sp-md);flex-wrap:wrap;align-items:center}
+.duo-wait{display:flex;align-items:center;gap:var(--sp-md);flex-wrap:wrap}
+.duo-wait b{font-family:var(--f-display);font-size:1.05rem;font-weight:700}
+.duo .pulse{width:10px;height:10px;background:var(--red);transform:rotate(45deg);animation:duoPulse 1.2s var(--ease-io) infinite;flex:none}
+@keyframes duoPulse{50%{opacity:.25}}
+.invites{position:fixed;right:var(--sp-md);bottom:var(--sp-md);z-index:var(--z-toast);display:grid;gap:8px;width:min(380px,calc(100% - 2 * var(--sp-md)))}
+.invites:empty{display:none}
+.invite{background:var(--s2);border:1px solid var(--red);padding:var(--sp-md);display:grid;gap:var(--sp-sm);animation:toastIn .5s var(--ease-out) both}
+.invite-who{display:flex;gap:var(--sp-sm);align-items:center;min-width:0}
+.invite-who b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.invite-who small{color:var(--tx3);font-size:.8rem}
+.invite-acts{display:flex;gap:var(--sp-xs)}
+.invite-acts .btn{flex:1}
+@media (max-width:860px){.invites{top:68px;bottom:auto;right:var(--sp-sm);width:calc(100% - 2 * var(--sp-sm))}}
+
 /* ---------- responsive ---------- */
 @media (max-width:1180px){
   .arena{grid-template-columns:260px minmax(0,1fr)}
@@ -886,6 +1010,307 @@ const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeo
 async function sha(s) { const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join(''); }
 const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }));
 
+/* =================== i18n (RU / EN) =================== */
+const LANGS = ['ru', 'en'];
+let LANG = localStorage.getItem('mog_lang');
+if (!LANGS.includes(LANG)) LANG = /^(ru|kk|uk|be|ky|uz|tg)/i.test(navigator.language || '') ? 'ru' : 'en';
+const EN = {
+  ' · тренировка': ' · practice',
+  ' замогал(а) ': ' mogged ',
+  '10 побед': '10 wins',
+  '25 боёв': '25 battles',
+  '3 победы подряд': '3 wins in a row',
+  '5 побед подряд': '5 wins in a row',
+  '8 с': '8 s',
+  'ELO 1200+': 'ELO 1200+',
+  'ELO обновится после подтверждения': 'ELO updates after confirmation',
+  'P2P-видео не соединилось. Бой всё равно начнётся': 'P2P video failed to connect. The battle will start anyway',
+  '{n} дн назад': '{n}d ago',
+  '{n} мин назад': '{n} min ago',
+  '{n} ч назад': '{n}h ago',
+  'Ава обновлена': 'Avatar updated',
+  'Аватар и теги': 'Avatar & tags',
+  'Алмаз': 'Diamond',
+  'Арена': 'Arena',
+  'Ачивка: ': 'Achievement: ',
+  'Ачивки': 'Achievements',
+  'БЭМ': 'BEM',
+  'База данных не настроена: запусти SQL из этого файла в Supabase.': 'Database is not set up: run the SQL from this file in Supabase.',
+  'Без звука': 'Muted',
+  'Без камеры никак: разреши доступ в браузере': 'No camera, no battle: allow access in your browser',
+  'Без пароля': 'No password',
+  'Бизнес и маркетинг': 'Business & Marketing',
+  'Бизнес, экономика и маркетинг': 'Business, Economics & Marketing',
+  'Бой идёт': 'Battle in progress',
+  'Бой начнётся, когда соперник зайдёт в комнату': 'The battle starts when your opponent joins the room',
+  'Бой начнётся, только когда соперник зайдёт в комнату': 'The battle starts only once your opponent joins the room',
+  'Боёв пока нет': 'No battles yet',
+  'Бронза': 'Bronze',
+  'В арену': 'To the arena',
+  'В бой': 'Face',
+  'Взгляд и ракурс': 'Gaze & angle',
+  'Винрейт': 'Win rate',
+  'Включи камеру и жми «В бой». Соперник подбирается в пределах ±{r} ELO.': 'Turn on your camera and hit “Face off”. Opponents are matched within ±{r} ELO.',
+  'Включить камеру': 'Turn on camera',
+  'Войди по ссылке на почту.': 'Sign in with an email link.',
+  'Войти': 'Sign in',
+  'Все': 'All',
+  'Все факультеты': 'All faculties',
+  'Вход': 'Sign in',
+  'Вход по почте': 'Email sign-in',
+  'Выбери факультет': 'Choose a faculty',
+  'Выйти': 'Leave',
+  'ГН': 'HUM',
+  'ГУ': 'GOV',
+  'Глаза': 'Eyes',
+  'Государственное управление': 'Public Administration',
+  'Госуправление': 'Public Administration',
+  'Гуманитарии': 'Humanities',
+  'Гуманитарные науки': 'Humanities',
+  'Демо · данные в браузере': 'Demo · data stays in your browser',
+  'Десятка': 'Perfect Ten',
+  'Друг не зашёл в комнату. Бой отменён': 'Your friend didn’t join the room. Battle cancelled',
+  'Ещё бой ': 'Another battle ',
+  'Ждём соперника · 1/2': 'Waiting for opponent · 1/2',
+  'Забыл пароль? ': 'Forgot your password? ',
+  'Заверши профиль': 'Finish your profile',
+  'Завсегдатай': 'Regular',
+  'Загрузить аватар': 'Upload avatar',
+  'Замогали': 'Mogged',
+  'Заполни профиль, чтобы выйти на арену': 'Fill in your profile to enter the arena',
+  'Заходим в комнату': 'Joining the room',
+  'Звук': 'Sound',
+  'Здесь пока никого': 'Nobody here yet',
+  'Золото': 'Gold',
+  'Золотое сечение': 'Golden ratio',
+  'Золотой пик': 'Golden Peak',
+  'Игрок': 'Player',
+  'Имя': 'Name',
+  'Имя: от 2 символов': 'Name: at least 2 characters',
+  'История': 'History',
+  'Ищем лицо': 'Looking for a face',
+  'Камера': 'Camera',
+  'Лента боёв': 'Battle feed',
+  'Лицо в кадре': 'Face in frame',
+  'Лицо не найдено': 'No face found',
+  'Лицо целиком в кадре, свет спереди, смотри в объектив': 'Whole face in frame, light in front, look into the lens',
+  'Лучшая серия': 'Best streak',
+  'Любые буквы и цифры, от 2 до 24 символов.': 'Any letters and digits, 2 to 24 characters.',
+  'МЕД': 'MED',
+  'Матчмейкинг': 'Matchmaking',
+  'Медицина': 'Medicine',
+  'Микрофон': 'Mic',
+  'Микрофон недоступен': 'Microphone unavailable',
+  'Мог-лорд': 'Mog Lord',
+  'Модель разметки не загрузилась': 'The face model failed to load',
+  'Мой факультет': 'My faculty',
+  'На арену': 'To the arena',
+  'Найти соперника': 'Find an opponent',
+  'Настройки': 'Settings',
+  'Не загрузилось': 'Failed to load',
+  'Не загрузилось: ': 'Upload failed: ',
+  'Не меньше 6 символов.': 'At least 6 characters.',
+  'Не моргай': 'Don’t blink',
+  'Не получили снимок соперника. Матч отменён': 'Didn’t get the opponent’s snapshot. Match cancelled',
+  'Неверная почта или пароль': 'Wrong email or password',
+  'Неверная почта или пароль.': 'Wrong email or password.',
+  'Неудержимый': 'Unstoppable',
+  'Ник, почта, пароль. Никаких заглавных и спецсимволов.': 'Nickname, email, password. That’s it.',
+  'Никнейм': 'Nickname',
+  'Никнейм должен быть от 2 до 24 символов.': 'Nickname must be 2 to 24 characters.',
+  'Новичок': 'Rookie',
+  'Новый боец': 'New fighter',
+  'Новый профиль': 'New profile',
+  'Новый ранг:': 'New rank:',
+  'Нужна картинка': 'Please pick an image',
+  'О себе': 'About',
+  'Оба здесь · видео через сеть': 'Both here · video via network',
+  'Оба здесь · соединяем видео': 'Both here · connecting video',
+  'Оба здесь · старт': 'Both here · starting',
+  'Отменить ': 'Cancel ',
+  'Ошибка сервера': 'Server error',
+  'Ошибка сети.': 'Network error.',
+  'Пара слов, которые увидит соперник': 'A few words your opponent will see',
+  'Пароль': 'Password',
+  'Пароль должен быть не короче 6 символов.': 'Password must be at least 6 characters.',
+  'Первая кровь': 'First Blood',
+  'Первая победа': 'First win',
+  'Первый бой на этом факультете, и ты сразу в топе.': 'Win one battle for this faculty and you’re instantly on top.',
+  'Пик': 'Peak',
+  'Письмо отправлено на {email}. Открой его и нажми ссылку: ты войдёшь автоматически.': 'Email sent to {email}. Open it and tap the link: you’ll be signed in automatically.',
+  'Платина': 'Platinum',
+  'Победа': 'Victory',
+  'Победы': 'Wins',
+  'Поиск соперника': 'Searching for opponent',
+  'Поиск упал: ': 'Search failed: ',
+  'Пока тихо. Сыграй первый бой, и он появится тут.': 'Quiet for now. Play the first battle and it’ll show up here.',
+  'Показываем видеопоток через Realtime…': 'Streaming video via Realtime…',
+  'Поражения': 'Losses',
+  'Почта': 'Email',
+  'Почта не подтверждена. Нажми ссылку из письма или войди без пароля.': 'Email not confirmed. Tap the link in the email or sign in without a password.',
+  'Почти готово. Мы отправили письмо на {email}: нажми ссылку, и ты войдёшь.': 'Almost done. We sent an email to {email}: tap the link and you’re in.',
+  'Приготовься': 'Get ready',
+  'Прислать ссылку': 'Send link',
+  'Пришлём письмо со ссылкой: нажмёшь, и ты сразу внутри.': 'We’ll email you a link: tap it and you’re in.',
+  'Проверь почту, похоже на ошибку.': 'Check your email, looks like a typo.',
+  'Профиль': 'Profile',
+  'Профиль готов. Погнали': 'Profile ready. Let’s go',
+  'Разделы': 'Sections',
+  'Разметка лица': 'Face mesh',
+  'Разогнался': 'Warmed Up',
+  'Разреши доступ к камере в настройках браузера': 'Allow camera access in your browser settings',
+  'Регистрация': 'Sign up',
+  'Рейтинг': 'Leaderboard',
+  'Рейтинг|mode': 'Ranked',
+  'Выйти|logout': 'Log out',
+  'Рейтинговый бой': 'Ranked battle',
+  'С возвращением': 'Welcome back',
+  'Сейчас начнём': 'Starting now',
+  'Серебро': 'Silver',
+  'Симметрия': 'Symmetry',
+  'Сканируем арену': 'Scanning the arena',
+  'Слишком много писем. Подожди немного и попробуй снова.': 'Too many emails. Wait a bit and try again.',
+  'Сменить аву': 'Change avatar',
+  'Смотри в камеру и держи лицо': 'Look into the camera and hold your face',
+  'Сначала выйди из комнаты': 'Leave the room first',
+  'Снимок сделан. Размечаем лица…': 'Snapshot taken. Mapping faces…',
+  'Соединяем видеочат…': 'Connecting video chat…',
+  'Создать аккаунт': 'Create account',
+  'Соперник вышел из комнаты': 'Opponent left the room',
+  'Соперник найден': 'Opponent found',
+  'Соперник не зашёл в комнату. Ищем другого': 'Opponent didn’t join the room. Finding another',
+  'Соперник строго ': 'Opponent strictly within ',
+  'Сохранено': 'Saved',
+  'Сохранить': 'Save',
+  'Счёт соперника пересчитан по видеопотоку: присланный снимок не совпал с трансляцией': 'Opponent’s score was recalculated from the video stream: their snapshot didn’t match the broadcast',
+  'Таблица ELO': 'ELO leaderboard',
+  'Твои бои': 'Your battles',
+  'Твой ELO ждёт.': 'Your ELO is waiting.',
+  'Теги · до 6': 'Tags · up to 6',
+  'Тренировка': 'Practice',
+  'Тренировка без ELO': 'Practice, no ELO',
+  'Трети лица': 'Facial thirds',
+  'Ты · ': 'You · ',
+  'Ты вышел из комнаты': 'You left the room',
+  'Ты останешься в системе на этом устройстве.': 'You’ll stay signed in on this device.',
+  'Убрать': 'Remove',
+  'Факультет': 'Faculty',
+  'Фото не нужно: бой идёт вживую по видео': 'No photo needed: battles are live on video',
+  'ЦТ': 'DT',
+  'Цифровые технологии': 'Digital Technologies',
+  'Челюсть': 'Jawline',
+  'Шаг 1 из 1': 'Step 1 of 1',
+  'Эта почта уже зарегистрирована': 'This email is already registered',
+  'Эта почта уже зарегистрирована. Войди или используй вход по ссылке.': 'This email is already registered. Sign in or use the email link.',
+  'Этот код не подошёл.': 'That code didn’t work.',
+  'Этот никнейм уже занят.': 'That nickname is taken.',
+  'Юзернейм': 'Username',
+  'Юзернейм уже занят': 'Username is taken',
+  'Юзернейм: 3-20 символов, латиница, цифры, _ и .': 'Username: 3-20 characters, Latin letters, digits, _ and .',
+  'в очереди': 'in queue',
+  'вершина': 'top tier',
+  'видео через сеть…': 'video via network…',
+  'винрейт': 'win rate',
+  'включена': 'on',
+  'все факультеты': 'all faculties',
+  'готова': 'ready',
+  'грузится': 'loading',
+  'до «{n}» {d}': '{d} to “{n}”',
+  'есть': 'yes',
+  'ещё тег': 'another tag',
+  'ждёт': 'waiting',
+  'живой соперник': 'live opponent',
+  'заходит в комнату…': 'joining the room…',
+  'или код из письма': 'or the code from the email',
+  'как тебя зовут': 'what should we call you',
+  'код': 'code',
+  'комната': 'room',
+  'лицом': 'off',
+  'например gym, кодинг': 'e.g. gym, coding',
+  'не видно': 'not visible',
+  'нужна': 'required',
+  'окно ELO': 'ELO window',
+  'онлайн': 'online',
+  'ошибка': 'error',
+  'пик ELO': 'peak ELO',
+  'по желанию': 'optional',
+  'победы / поражения': 'wins / losses',
+  'подключаем видео…': 'connecting video…',
+  'сейчас': 'now',
+  'серия побед': 'win streak',
+  'скан лица': 'face scan',
+  'сохраняется навсегда': 'saved forever',
+  'считаем ELO…': 'calculating ELO…',
+  'только что': 'just now',
+  'тренировка, без ELO': 'practice, no ELO',
+  // friends & challenges
+  'Бой с другом': 'Battle a friend',
+  'ник соперника, например @nick': 'opponent’s username, e.g. @nick',
+  'Вызвать': 'Challenge',
+  'Пригласить по ссылке': 'Invite via link',
+  'Вызов отправлен': 'Challenge sent',
+  'Приглашение по ссылке': 'Invite link',
+  'Ждём ответа от @{nick}': 'Waiting for @{nick} to respond',
+  'Ждём друга по ссылке': 'Waiting for your friend to open the link',
+  'Копировать': 'Copy',
+  'Поделиться': 'Share',
+  'Отменить вызов': 'Cancel challenge',
+  'Не закрывай вкладку: бой начнётся сам, как только друг примет': 'Keep this tab open: the battle starts as soon as your friend accepts',
+  'Го в FACEMATCH 1 на 1': 'Face me 1v1 on FACEMATCH',
+  'Ссылка скопирована. Скинь её другу': 'Link copied. Send it to your friend',
+  'Скопируй ссылку вручную': 'Copy the link manually',
+  'Бой с другом работает только с подключённой базой Supabase': 'Friend battles need a connected Supabase database',
+  'Впиши ник соперника': 'Enter your opponent’s username',
+  'Сначала отмени текущий вызов': 'Cancel your current challenge first',
+  'Сначала отмени вызов другу': 'Cancel your friend challenge first',
+  'Вызов отправлен @{nick}': 'Challenge sent to @{nick}',
+  '@{nick} отказался от боя': '@{nick} declined the battle',
+  'Вызов отменён': 'Challenge cancelled',
+  'Вызов истёк': 'Challenge expired',
+  'Вызов уже неактуален': 'This challenge is no longer active',
+  '{name} принял(а) вызов. В бой!': '{name} accepted. Fight!',
+  'вызывает тебя на бой': 'challenges you',
+  'рейтинг': 'ranked',
+  'тренировка': 'practice',
+  'Принять': 'Accept',
+  'Отклонить': 'Decline',
+  'Приглашение не найдено': 'Invite not found',
+  'Это твоя ссылка-приглашение: отправь её другу': 'That’s your own invite link: send it to a friend',
+  'Приглашение уже неактуально': 'This invite is no longer active',
+  'Игрок с таким ником не найден': 'No player with that username',
+  'Нельзя вызвать самого себя': 'You can’t challenge yourself',
+  'Этот вызов адресован другому игроку': 'This challenge is for another player',
+  'Вызовы не настроены: запусти обновлённый SQL из этого файла в Supabase.': 'Challenges aren’t set up: run the updated SQL from this file in Supabase.',
+  'вызвать': 'challenge',
+  'Тебя позвали на бой по ссылке. Войди или создай аккаунт, и вызов откроется.': 'You’ve been invited to a battle. Sign in or create an account to accept.',
+};
+
+function tr(s, v) {
+  let r = LANG === 'en' ? (EN[s] ?? s) : s;
+  if (LANG === 'en' && !(s in EN)) console.warn('[i18n] missing EN:', s);
+  r = r.split('|')[0];
+  if (v) r = r.replace(/\{(\w+)\}/g, (m, k) => (k in v ? v[k] : m));
+  return r;
+}
+function i18nProps(arr, keys) {
+  arr.forEach(o => keys.forEach(k => { const raw = o[k]; Object.defineProperty(o, k, { get: () => tr(raw), enumerable: true, configurable: true }); }));
+  return arr;
+}
+function applyLangMeta() { document.documentElement.lang = LANG; document.title = 'FACEMATCH · ' + tr('Арена'); }
+applyLangMeta();
+const langBtnHTML = id => `<button class="lang" type="button" id="${id}" aria-label="Language / Язык"><i data-lucide="languages"></i>${LANG.toUpperCase()}</button>`;
+function setLang(l) {
+  if (!LANGS.includes(l) || l === LANG) return;
+  if (S.battle && !S.battle.finished) { toast(tr('Сначала выйди из комнаты')); return; }
+  LANG = l; localStorage.setItem('mog_lang', l); applyLangMeta();
+  if (!S.user) { renderAuth(); return; }
+  renderShell();
+  if (!S.profile) { lockNav(true); S.view = 'profile'; viewProfile(); icons(); }
+  else go(S.view === 'result' || S.view === 'battle' ? 'arena' : S.view);
+  const box = $('#invites'); if (box) box.dataset.sig = '';
+  renderInvites();
+}
+
 function icons() { try { window.lucide?.createIcons(); } catch (e) {} }
 if (!window.lucide) {
   const s = document.createElement('script');
@@ -896,10 +1321,10 @@ if (!window.lucide) {
 function timeAgo(t) {
   if (!t) return '';
   const s = Math.max(1, Math.round((Date.now() - new Date(t).getTime()) / 1000));
-  if (s < 60) return 'только что';
-  if (s < 3600) return Math.round(s / 60) + ' мин назад';
-  if (s < 86400) return Math.round(s / 3600) + ' ч назад';
-  return Math.round(s / 86400) + ' дн назад';
+  if (s < 60) return tr('только что');
+  if (s < 3600) return tr('{n} мин назад', { n: Math.round(s / 60) });
+  if (s < 86400) return tr('{n} ч назад', { n: Math.round(s / 3600) });
+  return tr('{n} дн назад', { n: Math.round(s / 86400) });
 }
 
 function countUp(el, from, to, dur = 1200, dec = 0) {
@@ -930,12 +1355,16 @@ const FACULTIES = [
   { id: 'gov', name: 'Государственное управление', short: 'ГУ' },
   { id: 'medicine', name: 'Медицина', short: 'МЕД' },
 ];
-const fac = id => FACULTIES.find(f => f.id === id) || { name: 'Факультет', short: '?' };
+i18nProps(FACULTIES, ['name', 'short']);
+const fac = id => FACULTIES.find(f => f.id === id) || { name: tr('Факультет'), short: '?' };
 const TAG_SUGGEST = ['gym', 'кодинг', 'аниме', 'футбол', 'музыка', 'дизайн', 'стартапы', 'кофе', 'книги', 'путешествия', 'киберспорт', 'фото'];
+const TAG_SUGGEST_EN = ['gym', 'coding', 'anime', 'football', 'music', 'design', 'startups', 'coffee', 'books', 'travel', 'esports', 'photo'];
+const tagSuggest = () => LANG === 'en' ? TAG_SUGGEST_EN : TAG_SUGGEST;
 const TIERS = [
   { n: 'Новичок', min: 0 }, { n: 'Бронза', min: 900 }, { n: 'Серебро', min: 1000 }, { n: 'Золото', min: 1100 },
   { n: 'Платина', min: 1250 }, { n: 'Алмаз', min: 1400 }, { n: 'Мог-лорд', min: 1600 },
 ];
+i18nProps(TIERS, ['n']);
 function tierOf(elo) {
   let i = 0; TIERS.forEach((t, j) => { if (elo >= t.min) i = j; });
   const cur = TIERS[i], next = TIERS[i + 1];
@@ -949,6 +1378,7 @@ const ACH = [
   { id: 'p1200', n: 'Золотой пик', d: 'ELO 1200+', ok: p => p.peak_elo >= 1200, ic: 'crown' },
   { id: 'g25', n: 'Завсегдатай', d: '25 боёв', ok: p => (p.wins + p.losses) >= 25, ic: 'repeat' },
 ];
+i18nProps(ACH, ['n', 'd']);
 const achSet = p => new Set(p ? ACH.filter(a => a.ok(p)).map(a => a.id) : []);
 function ava(p, size = '') {
   return `<span class="ava ${size}">${p?.avatar_url ? `<img src="${esc(p.avatar_url)}" alt="">` : esc(initials(p?.display_name))}</span>`;
@@ -964,6 +1394,7 @@ const S = {
   muted: localStorage.getItem('mog_muted') === '1',
   model: 'idle', faceOk: false, liveStarted: false,
   authTab: 'login', authMsg: '',
+  duel: null, incoming: [], linkInv: null, dismissed: new Set(),
 };
 
 /* =================== sound =================== */
@@ -1050,7 +1481,7 @@ const MATCH_COLS = 'id,player_a,player_b,score_a,score_b,winner,ranked,elo_a_bef
   'a:profiles!matches_player_a_fkey(display_name,avatar_url,faculty),b:profiles!matches_player_b_fkey(display_name,avatar_url,faculty)';
 
 function SupaNet() {
-  const sbErr = e => { if (e?.code === '23505') return new Error('Юзернейм уже занят'); return new Error(e?.message || 'Ошибка сервера'); };
+  const sbErr = e => { if (e?.code === '23505') return new Error(tr('Юзернейм уже занят')); return new Error(e?.message || tr('Ошибка сервера')); };
   function room(id, uid) {
     const handlers = {}; let presCb = () => {};
     const ch = sb.channel('room:' + id, { config: { presence: { key: uid }, broadcast: { self: false } } });
@@ -1067,7 +1498,7 @@ function SupaNet() {
   }
   return {
     async session() { const { data } = await sb.auth.getSession(); return data.session?.user || null; },
-    async signIn(email, pass) { const { data, error } = await sb.auth.signInWithPassword({ email, password: pass }); if (error) throw new Error(error.message === 'Invalid login credentials' ? 'Неверная почта или пароль' : error.message); return data.user; },
+    async signIn(email, pass) { const { data, error } = await sb.auth.signInWithPassword({ email, password: pass }); if (error) throw new Error(error.message === 'Invalid login credentials' ? tr('Неверная почта или пароль') : error.message); return data.user; },
     async signUp(email, pass, prof) {
       localStorage.setItem('mog_pending_profile', JSON.stringify(prof));
       const { data, error } = await sb.auth.signUp({ email, password: pass });
@@ -1166,6 +1597,44 @@ function SupaNet() {
     onFeed(cb) {
       sb.channel('feed').on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'matches' }, p => { if (p.new?.status === 'judged') cb(); }).subscribe();
     },
+    // ---- бой с другом ----
+    async matchInfo(mid, uid) {
+      const { data: m, error } = await sb.from('matches').select('*').eq('id', mid).single();
+      if (error) throw sbErr(error);
+      const role = m.player_a === uid ? 'a' : 'b';
+      const { data: opp, error: e2 } = await sb.from('profiles').select('*').eq('id', role === 'a' ? m.player_b : m.player_a).single();
+      if (e2) throw sbErr(e2);
+      return { id: mid, role, opp, ranked: m.ranked, challenge: true, status: m.status };
+    },
+    async createChallenge(username, ranked) {
+      const { data, error } = await sb.rpc('create_challenge', { p_username: username || null, p_ranked: !!ranked });
+      if (error) throw new Error(chErr(error));
+      return Array.isArray(data) ? data[0] : data;
+    },
+    async peekChallenge(code) {
+      const { data, error } = await sb.rpc('peek_challenge', { p_code: code });
+      if (error) throw new Error(chErr(error));
+      return data;
+    },
+    async acceptChallenge(code) {
+      const { data, error } = await sb.rpc('accept_challenge', { p_code: code });
+      if (error) throw new Error(chErr(error));
+      return data;
+    },
+    async declineChallenge(id) { await sb.rpc('decline_challenge', { p_id: id }); },
+    async challengeState(id) {
+      const { data, error } = await sb.from('challenges').select('status,match_id').eq('id', id).maybeSingle();
+      if (error) throw new Error(chErr(error));
+      return data;
+    },
+    async incoming(uid) {
+      const { data, error } = await sb.from('challenges')
+        .select('id,code,ranked,expires_at,from:profiles!challenges_from_user_fkey(id,display_name,username,avatar_url,elo,faculty,tags)')
+        .eq('to_user', uid).eq('status', 'pending').gt('expires_at', new Date().toISOString())
+        .order('created_at', { ascending: false }).limit(5);
+      if (error) throw new Error(chErr(error));
+      return data || [];
+    },
   };
 }
 
@@ -1188,13 +1657,13 @@ function DemoNet() {
     async signIn(email, pass) {
       const h = await sha(pass);
       const p = Object.values(reg()).find(x => x.email === email.toLowerCase());
-      if (!p || p.pass !== h) throw new Error('Неверная почта или пароль');
+      if (!p || p.pass !== h) throw new Error(tr('Неверная почта или пароль'));
       myId = p.id; sessionStorage.setItem('mog_demo_uid', myId); return { id: myId };
     },
     async signUp(email, pass, prof) {
       const r = reg();
-      if (Object.values(r).some(x => x.email === email.toLowerCase())) throw new Error('Эта почта уже зарегистрирована');
-      if (Object.values(r).some(x => x.username.toLowerCase() === prof.username.toLowerCase())) throw new Error('Юзернейм уже занят');
+      if (Object.values(r).some(x => x.email === email.toLowerCase())) throw new Error(tr('Эта почта уже зарегистрирована'));
+      if (Object.values(r).some(x => x.username.toLowerCase() === prof.username.toLowerCase())) throw new Error(tr('Юзернейм уже занят'));
       const id = uuid();
       r[id] = { id, email: email.toLowerCase(), pass: await sha(pass), ...prof, bio: '', tags: [], avatar_url: null, elo: 1000, peak_elo: 1000, wins: 0, losses: 0, streak: 0, best_streak: 0, created_at: new Date().toISOString() };
       saveReg(r); myId = id; sessionStorage.setItem('mog_demo_uid', id); return { user: { id } };
@@ -1203,7 +1672,7 @@ function DemoNet() {
     async getProfile(uid) { return pub(reg()[uid]) || null; },
     async saveProfile(uid, patch) {
       const r = reg();
-      if (patch.username && Object.values(r).some(x => x.id !== uid && x.username.toLowerCase() === patch.username.toLowerCase())) throw new Error('Юзернейм уже занят');
+      if (patch.username && Object.values(r).some(x => x.id !== uid && x.username.toLowerCase() === patch.username.toLowerCase())) throw new Error(tr('Юзернейм уже занят'));
       r[uid] = { ...r[uid], ...patch }; saveReg(r); return pub(r[uid]);
     },
     async uploadAvatar(uid, blob) { return await new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(blob); }); },
@@ -1306,6 +1775,14 @@ function DemoNet() {
     async history(uid) { return getMatches().filter(m => m.player_a === uid || m.player_b === uid).slice(0, 30); },
     async feed() { return getMatches().slice(0, 12); },
     onFeed(cb) { listeners.add(m => { if (m.k === 'feed') cb(); }); },
+    // бой с другом нужен сервер: в демо-режиме недоступен
+    async matchInfo() { throw new Error(tr('Бой с другом работает только с подключённой базой Supabase')); },
+    async createChallenge() { throw new Error(tr('Бой с другом работает только с подключённой базой Supabase')); },
+    async peekChallenge() { return null; },
+    async acceptChallenge() { throw new Error(tr('Бой с другом работает только с подключённой базой Supabase')); },
+    async declineChallenge() {},
+    async challengeState() { return null; },
+    async incoming() { return []; },
   };
 }
 const Net = USE_SB ? SupaNet() : DemoNet();
@@ -1349,6 +1826,7 @@ const CATS = [
   { k: 'phi', n: 'Золотое сечение', w: .14 },
   { k: 'gaze', n: 'Взгляд и ракурс', w: .12 },
 ];
+i18nProps(CATS, ['n']);
 
 /* Метрики по мотивам attractivenesstest.com / Rate My Face: симметрия, пропорции φ, трети, челюсть, кантальный наклон, взгляд */
 function scoreFace(L, w, h) {
@@ -1474,15 +1952,15 @@ function validEmail(v) { return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(v ||
 function cleanNick(v) { return String(v || '').replace(/\s+/g, ' ').trim(); }
 function authErr(e) {
   const m = String((e && (e.message || e.error_description)) || e || '');
-  if (/invalid login credentials/i.test(m)) return 'Неверная почта или пароль.';
-  if (/already registered|already exists/i.test(m)) return 'Эта почта уже зарегистрирована. Войди или используй вход по ссылке.';
-  if (/not confirmed/i.test(m)) return 'Почта не подтверждена. Нажми ссылку из письма или войди без пароля.';
-  if (/rate limit|too many|security purposes/i.test(m)) return 'Слишком много писем. Подожди немного и попробуй снова.';
-  if (/password/i.test(m)) return 'Пароль должен быть не короче 6 символов.';
-  if (/invalid.*email|email.*invalid/i.test(m)) return 'Проверь почту, похоже на ошибку.';
-  if (/token|otp|expired/i.test(m)) return 'Этот код не подошёл.';
-  if (/could not find the function|does not exist|schema cache|no profile/i.test(m)) return 'База данных не настроена: запусти SQL из этого файла в Supabase.';
-  return m || 'Ошибка сети.';
+  if (/invalid login credentials/i.test(m)) return tr('Неверная почта или пароль.');
+  if (/already registered|already exists/i.test(m)) return tr('Эта почта уже зарегистрирована. Войди или используй вход по ссылке.');
+  if (/not confirmed/i.test(m)) return tr('Почта не подтверждена. Нажми ссылку из письма или войди без пароля.');
+  if (/rate limit|too many|security purposes/i.test(m)) return tr('Слишком много писем. Подожди немного и попробуй снова.');
+  if (/password/i.test(m)) return tr('Пароль должен быть не короче 6 символов.');
+  if (/invalid.*email|email.*invalid/i.test(m)) return tr('Проверь почту, похоже на ошибку.');
+  if (/token|otp|expired/i.test(m)) return tr('Этот код не подошёл.');
+  if (/could not find the function|does not exist|schema cache|no profile/i.test(m)) return tr('База данных не настроена: запусти SQL из этого файла в Supabase.');
+  return m || tr('Ошибка сети.');
 }
 function setAuthErr(msg) {
   const el = $('#aerr');
@@ -1500,49 +1978,50 @@ function lastAuthEmail() { return localStorage.getItem('mog_last_email') || ''; 
 function renderAuth() {
   document.body.classList.remove('nav-locked');
   const tab = S.authTab || 'login';
-  const tabs = ['login', 'reg', 'link'].map(k => `<button type="button" data-tab="${k}" aria-pressed="${tab === k}">${k === 'login' ? 'Вход' : k === 'reg' ? 'Регистрация' : 'Без пароля'}</button>`).join('');
+  const tabs = ['login', 'reg', 'link'].map(k => `<button type="button" data-tab="${k}" aria-pressed="${tab === k}">${k === 'login' ? tr('Вход') : k === 'reg' ? tr('Регистрация') : tr('Без пароля')}</button>`).join('');
   let form = '';
   if (tab === 'login') form = `
-    <h1>С возвращением</h1><p class="lead">Твой ELO ждёт.</p>
-    <div class="field"><label for="ae">Почта</label><input class="input" id="ae" type="email" autocomplete="email" inputmode="email" placeholder="you@mail.com"></div>
-    <div class="field"><label for="ap">Пароль</label><input class="input" id="ap" type="password" autocomplete="current-password"></div>
+    <h1>${tr('С возвращением')}</h1><p class="lead">${tr('Твой ELO ждёт.')}</p>
+    <div class="field"><label for="ae">${tr('Почта')}</label><input class="input" id="ae" type="email" autocomplete="email" inputmode="email" placeholder="you@mail.com"></div>
+    <div class="field"><label for="ap">${tr('Пароль')}</label><input class="input" id="ap" type="password" autocomplete="current-password"></div>
     <div class="err" id="aerr"></div>
-    <button class="btn primary" type="submit">Войти</button>
-    <p class="auth-note">Забыл пароль? <a class="linkish" data-tab="link">Войди по ссылке на почту.</a></p>`;
+    <button class="btn primary" type="submit">${tr('Войти')}</button>
+    <p class="auth-note">${tr('Забыл пароль? ')}<a class="linkish" data-tab="link">${tr('Войди по ссылке на почту.')}</a></p>`;
   else if (tab === 'reg') form = `
-    <h1>Создать аккаунт</h1><p class="lead">Ник, почта, пароль. Никаких заглавных и спецсимволов.</p>
-    <div class="field"><label for="an">Никнейм</label><input class="input" id="an" maxlength="24" autocomplete="nickname" placeholder="как тебя зовут"><span class="hint">Любые буквы и цифры, от 2 до 24 символов.</span></div>
-    <div class="field"><label for="ae">Почта</label><input class="input" id="ae" type="email" autocomplete="email" inputmode="email" placeholder="you@mail.com"></div>
-    <div class="field"><label for="ap">Пароль</label><input class="input" id="ap" type="password" autocomplete="new-password"><span class="hint">Не меньше 6 символов.</span></div>
-    <div class="field"><label for="af">Факультет</label><select class="select" id="af">${FACULTIES.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join('')}</select></div>
+    <h1>${tr('Создать аккаунт')}</h1><p class="lead">${tr('Ник, почта, пароль. Никаких заглавных и спецсимволов.')}</p>
+    <div class="field"><label for="an">${tr('Никнейм')}</label><input class="input" id="an" maxlength="24" autocomplete="nickname" placeholder="${tr('как тебя зовут')}"><span class="hint">${tr('Любые буквы и цифры, от 2 до 24 символов.')}</span></div>
+    <div class="field"><label for="ae">${tr('Почта')}</label><input class="input" id="ae" type="email" autocomplete="email" inputmode="email" placeholder="you@mail.com"></div>
+    <div class="field"><label for="ap">${tr('Пароль')}</label><input class="input" id="ap" type="password" autocomplete="new-password"><span class="hint">${tr('Не меньше 6 символов.')}</span></div>
+    <div class="field"><label for="af">${tr('Факультет')}</label><select class="select" id="af">${FACULTIES.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join('')}</select></div>
     <div class="err" id="aerr"></div>
-    <button class="btn primary" type="submit">Создать аккаунт</button>`;
+    <button class="btn primary" type="submit">${tr('Создать аккаунт')}</button>`;
   else form = `
-    <h1>Вход по почте</h1><p class="lead">Пришлём письмо со ссылкой: нажмёшь, и ты сразу внутри.</p>
-    <div class="field"><label for="ae">Почта</label><input class="input" id="ae" type="email" autocomplete="email" inputmode="email" placeholder="you@mail.com" value="${esc(lastAuthEmail())}"></div>
+    <h1>${tr('Вход по почте')}</h1><p class="lead">${tr('Пришлём письмо со ссылкой: нажмёшь, и ты сразу внутри.')}</p>
+    <div class="field"><label for="ae">${tr('Почта')}</label><input class="input" id="ae" type="email" autocomplete="email" inputmode="email" placeholder="you@mail.com" value="${esc(lastAuthEmail())}"></div>
     <div class="err" id="aerr"></div>
-    <button class="btn primary" type="submit">Прислать ссылку</button>
-    <div class="divider">или код из письма</div>
-    <div class="code-row"><input class="input mono" id="acode" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="код"><button class="btn" type="button" id="acodeb">Войти</button></div>`;
+    <button class="btn primary" type="submit">${tr('Прислать ссылку')}</button>
+    <div class="divider">${tr('или код из письма')}</div>
+    <div class="code-row"><input class="input mono" id="acode" inputmode="numeric" autocomplete="one-time-code" maxlength="10" placeholder="${tr('код')}"><button class="btn" type="button" id="acodeb">${tr('Войти')}</button></div>`;
 
   $('#app').innerHTML = `<div class="auth">
     <section class="auth-poster">
       <div class="poster-grid"></div>
-      <div class="brand"><span class="brand-mark"></span>MOGGED<span class="brand-sub">Арена</span></div>
+      <div class="brand"><span class="brand-mark"></span>FACEMATCH<span class="brand-sub">${tr('Арена')}</span></div>
       <h2 class="poster-title"><span>MOG</span><span class="outline">OR GET</span><span>MOGGED</span></h2>
       <div class="poster-rules">
-        <div><b>8 с</b><span>скан лица</span></div>
-        <div><b>1 v 1</b><span>живой соперник</span></div>
-        <div><b>ELO</b><span>сохраняется навсегда</span></div>
+        <div><b>${tr('8 с')}</b><span>${tr('скан лица')}</span></div>
+        <div><b>1 v 1</b><span>${tr('живой соперник')}</span></div>
+        <div><b>ELO</b><span>${tr('сохраняется навсегда')}</span></div>
       </div>
     </section>
     <section class="auth-form-wrap">
-      <div class="auth-lang"></div>
+      <div class="auth-lang">${langBtnHTML('authLang')}</div>
       <form class="auth-form view" id="aform" novalidate>
         <div class="seg auth-tabs" role="tablist">${tabs}</div>
         ${S.authMsg ? `<p class="okmsg">${esc(S.authMsg)}</p>` : ''}
+        ${pendingInvite() ? `<p class="okmsg">${tr('Тебя позвали на бой по ссылке. Войди или создай аккаунт, и вызов откроется.')}</p>` : ''}
         ${form}
-        <p class="auth-note">Ты останешься в системе на этом устройстве.</p>
+        <p class="auth-note">${tr('Ты останешься в системе на этом устройстве.')}</p>
       </form>
     </section>
   </div>`;
@@ -1554,6 +2033,8 @@ function renderAuth() {
     renderAuth();
   });
 
+  $('#authLang').onclick = () => setLang(LANG === 'ru' ? 'en' : 'ru');
+  icons();
   const f = $('#aform');
   f.onsubmit = e => { e.preventDefault(); submitAuth($('#aform button[type=submit]')); };
   const cb = $('#acodeb');
@@ -1563,24 +2044,24 @@ function renderAuth() {
 async function submitAuth(btn) {
   setAuthErr('');
   const email = ($('#ae') ? $('#ae').value : '').trim().toLowerCase();
-  if (!validEmail(email)) return setAuthErr('Проверь почту, похоже на ошибку.');
+  if (!validEmail(email)) return setAuthErr(tr('Проверь почту, похоже на ошибку.'));
   localStorage.setItem('mog_last_email', email);
   btn?.classList.add('is-loading');
   btn && (btn.disabled = true);
   try {
     if (S.authTab === 'login') {
       const pass = $('#ap').value;
-      if (pass.length < 6) return setAuthErr('Пароль должен быть не короче 6 символов.');
+      if (pass.length < 6) return setAuthErr(tr('Пароль должен быть не короче 6 символов.'));
       await Net.signIn(email, pass);
       await boot();
     } else if (S.authTab === 'reg') {
       const nick = cleanNick($('#an').value), pass = $('#ap').value, faculty = $('#af').value;
-      if (nick.length < 2 || nick.length > 24) return setAuthErr('Никнейм должен быть от 2 до 24 символов.');
-      if (pass.length < 6) return setAuthErr('Пароль должен быть не короче 6 символов.');
-      if (await nickTaken(nick)) return setAuthErr('Этот никнейм уже занят.');
+      if (nick.length < 2 || nick.length > 24) return setAuthErr(tr('Никнейм должен быть от 2 до 24 символов.'));
+      if (pass.length < 6) return setAuthErr(tr('Пароль должен быть не короче 6 символов.'));
+      if (await nickTaken(nick)) return setAuthErr(tr('Этот никнейм уже занят.'));
       const r = await Net.signUp(email, pass, { display_name: nick, username: nick, faculty, bio: '', tags: [], avatar_url: null });
       if (r.confirm) {
-        S.authMsg = `Почти готово. Мы отправили письмо на ${email}: нажми ссылку, и ты войдёшь.`;
+        S.authMsg = tr('Почти готово. Мы отправили письмо на {email}: нажми ссылку, и ты войдёшь.', { email });
         S.authTab = 'link';
         renderAuth();
       } else {
@@ -1589,7 +2070,7 @@ async function submitAuth(btn) {
     } else {
       const { error } = await sb.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + location.pathname, shouldCreateUser: true } });
       if (error) throw error;
-      S.authMsg = `Письмо отправлено на ${email}. Открой его и нажми ссылку: ты войдёшь автоматически.`;
+      S.authMsg = tr('Письмо отправлено на {email}. Открой его и нажми ссылку: ты войдёшь автоматически.', { email });
       renderAuth();
     }
   } catch (e) {
@@ -1604,8 +2085,8 @@ async function verifyCode(btn) {
   setAuthErr('');
   const email = ($('#ae')?.value || lastAuthEmail()).trim().toLowerCase();
   const token = ($('#acode')?.value || '').replace(/\s/g, '');
-  if (!validEmail(email)) return setAuthErr('Проверь почту, похоже на ошибку.');
-  if (token.length < 6) return setAuthErr('Этот код не подошёл.');
+  if (!validEmail(email)) return setAuthErr(tr('Проверь почту, похоже на ошибку.'));
+  if (token.length < 6) return setAuthErr(tr('Этот код не подошёл.'));
   localStorage.setItem('mog_last_email', email);
   btn?.classList.add('is-loading'); btn && (btn.disabled = true);
   try {
@@ -1624,36 +2105,38 @@ async function verifyCode(btn) {
 function renderShell() {
   $('#app').innerHTML = `
   <header class="top">
-    <div class="brand"><span class="brand-mark"></span>MOGGED<span class="brand-sub">Арена</span></div>
-    <nav class="nav" aria-label="Разделы">
-      <a data-go="arena"><i data-lucide="swords" class="ni"></i><span>Арена</span><span class="kbd">1</span></a>
-      <a data-go="board"><i data-lucide="trophy" class="ni"></i><span>Рейтинг</span><span class="kbd">2</span></a>
-      <a data-go="history"><i data-lucide="history" class="ni"></i><span>История</span><span class="kbd">3</span></a>
-      <a data-go="profile"><i data-lucide="user-round" class="ni"></i><span>Профиль</span><span class="kbd">4</span></a>
+    <div class="brand"><span class="brand-mark"></span>FACEMATCH<span class="brand-sub">${tr('Арена')}</span></div>
+    <nav class="nav" aria-label="${tr('Разделы')}">
+      <a data-go="arena"><i data-lucide="swords" class="ni"></i><span>${tr('Арена')}</span><span class="kbd">1</span></a>
+      <a data-go="board"><i data-lucide="trophy" class="ni"></i><span>${tr('Рейтинг')}</span><span class="kbd">2</span></a>
+      <a data-go="history"><i data-lucide="history" class="ni"></i><span>${tr('История')}</span><span class="kbd">3</span></a>
+      <a data-go="profile"><i data-lucide="user-round" class="ni"></i><span>${tr('Профиль')}</span><span class="kbd">4</span></a>
     </nav>
     <div class="top-r">
-      <button class="icon-btn" id="muteBtn" aria-label="Звук"></button>
+      ${langBtnHTML('langBtn')}
+      <button class="icon-btn" id="muteBtn" aria-label="${tr('Звук')}"></button>
       <button class="me-chip" id="meChip" data-go="profile"></button>
     </div>
   </header>
   <main id="main"></main>
-  ${USE_SB ? '' : '<div class="demo-flag">Демо · данные в браузере</div>'}`;
+  ${USE_SB ? '' : `<div class="demo-flag">${tr('Демо · данные в браузере')}</div>`}`;
   $$('[data-go]').forEach(a => a.addEventListener('click', () => { SFX.click(); go(a.dataset.go); }));
   $('#muteBtn').onclick = () => { S.muted = !S.muted; localStorage.setItem('mog_muted', S.muted ? '1' : '0'); renderMute(); if (!S.muted) SFX.click(); };
+  $('#langBtn').onclick = () => { SFX.click(); setLang(LANG === 'ru' ? 'en' : 'ru'); };
   renderMute(); updateMe();
 }
 function renderMute() { const b = $('#muteBtn'); if (!b) return; b.innerHTML = `<i data-lucide="${S.muted ? 'volume-x' : 'volume-2'}"></i>`; icons(); }
 function updateMe(bump = false) {
   const c = $('#meChip'); if (!c) return;
   const p = S.profile;
-  if (!p) { c.innerHTML = `<span class="tier">Новый профиль</span>${ava(null)}`; return; }
+  if (!p) { c.innerHTML = `<span class="tier">${tr('Новый профиль')}</span>${ava(null)}`; return; }
   c.innerHTML = `<span class="elo${bump ? ' bump' : ''}">${p.elo}</span><span class="tier">${tierOf(p.elo).name}</span>${ava(p)}`;
 }
 function lockNav(on) { document.body.classList.toggle('nav-locked', on); }
 function setNavOn(v) { $$('.nav a').forEach(a => a.classList.toggle('on', a.dataset.go === v)); }
 
 function go(v) {
-  if (S.battle && !S.battle.finished && v !== 'battle') { toast('Сначала выйди из комнаты'); return; }
+  if (S.battle && !S.battle.finished && v !== 'battle') { toast(tr('Сначала выйди из комнаты')); return; }
   if (!S.profile && v !== 'profile') return;
   if (S.search && v !== 'arena') cancelSearch();
   if (S.lastRoom && v !== 'result') { const r = S.lastRoom; S.lastRoom = null; setTimeout(() => r.leave(), 100); }
@@ -1662,6 +2145,7 @@ function go(v) {
   ({ arena: viewArena, board: viewBoard, history: viewHistory, profile: viewProfile })[v]?.();
   icons();
   scrollTo({ top: 0 });
+  renderInvites();
 }
 
 /* =================== arena =================== */
@@ -1674,14 +2158,14 @@ function viewArena() {
         <video id="camPrev" autoplay muted playsinline></video>
         <canvas id="camFx"></canvas>
         <span class="viewfinder"></span>
-        <button class="empty" id="camOn" type="button"><i data-lucide="camera"></i><b>Включить камеру</b><span>Фото не нужно: бой идёт вживую по видео</span></button>
-        <span class="cam-state" id="camState">Ищем лицо</span>
+        <button class="empty" id="camOn" type="button"><i data-lucide="camera"></i><b>${tr('Включить камеру')}</b><span>${tr('Фото не нужно: бой идёт вживую по видео')}</span></button>
+        <span class="cam-state" id="camState">${tr('Ищем лицо')}</span>
       </div>
       <div class="you-name"><h3>${esc(p.display_name)}</h3><span class="mono">${p.elo}</span></div>
       <p class="you-meta">@${esc(p.username)} · ${fac(p.faculty).name}</p>
       ${tagsHTML(p.tags)}
       <div class="tierbar">
-        <div class="lbl"><b>${t.name}</b><span>${t.next ? `до «${t.next.n}» ${t.next.min - p.elo}` : 'вершина'}</span></div>
+        <div class="lbl"><b>${t.name}</b><span>${t.next ? tr('до «{n}» {d}', { n: t.next.n, d: t.next.min - p.elo }) : tr('вершина')}</span></div>
         <div class="track"><i id="tierFill"></i></div>
       </div>
       <ul class="checks" id="checks"></ul>
@@ -1689,38 +2173,39 @@ function viewArena() {
 
     <section class="arena-center">
       <div class="arena-head">
-        <div><p class="eyebrow">Матчмейкинг</p><h1 class="h-page">Найти соперника</h1></div>
+        <div><p class="eyebrow">${tr('Матчмейкинг')}</p><h1 class="h-page">${tr('Найти соперника')}</h1></div>
         <div class="controls">
           <div class="seg" id="scopeSeg">
-            <button data-scope="all" aria-pressed="${S.scope === 'all'}">Все факультеты</button>
-            <button data-scope="faculty" aria-pressed="${S.scope === 'faculty'}">Мой факультет</button>
+            <button data-scope="all" aria-pressed="${S.scope === 'all'}">${tr('Все факультеты')}</button>
+            <button data-scope="faculty" aria-pressed="${S.scope === 'faculty'}">${tr('Мой факультет')}</button>
           </div>
           <div class="seg" id="rankSeg">
-            <button data-ranked="1" aria-pressed="${S.ranked}">Рейтинг</button>
-            <button data-ranked="0" aria-pressed="${!S.ranked}">Тренировка</button>
+            <button data-ranked="1" aria-pressed="${S.ranked}">${tr('Рейтинг|mode')}</button>
+            <button data-ranked="0" aria-pressed="${!S.ranked}">${tr('Тренировка')}</button>
           </div>
         </div>
       </div>
       <div id="launchWrap"></div>
+      <div id="duelWrap"></div>
       <div class="stats-strip">
-        <div><b>${p.wins}<span class="muted">/</span>${p.losses}</b><small>победы / поражения</small></div>
-        <div><b>${total ? Math.round(p.wins / total * 100) : 0}%</b><small>винрейт</small></div>
-        <div><b>${p.streak}${p.streak >= 2 ? '<i data-lucide="flame" class="flame"></i>' : ''}</b><small>серия побед</small></div>
-        <div><b>${p.peak_elo}</b><small>пик ELO</small></div>
+        <div><b>${p.wins}<span class="muted">/</span>${p.losses}</b><small>${tr('победы / поражения')}</small></div>
+        <div><b>${total ? Math.round(p.wins / total * 100) : 0}%</b><small>${tr('винрейт')}</small></div>
+        <div><b>${p.streak}${p.streak >= 2 ? '<i data-lucide="flame" class="flame"></i>' : ''}</b><small>${tr('серия побед')}</small></div>
+        <div><b>${p.peak_elo}</b><small>${tr('пик ELO')}</small></div>
       </div>
     </section>
 
     <aside class="feed">
-      <div class="feed-head"><span class="eyebrow">Лента боёв</span><span class="live">live</span></div>
-      <div class="feed-online"><b id="onlineN">${S.online}</b><span>онлайн<br>сейчас</span></div>
+      <div class="feed-head"><span class="eyebrow">${tr('Лента боёв')}</span><span class="live">live</span></div>
+      <div class="feed-online"><b id="onlineN">${S.online}</b><span>${tr('онлайн')}<br>${tr('сейчас')}</span></div>
       <ol id="feedList"></ol>
     </aside>
   </div>`;
   requestAnimationFrame(() => { const f = $('#tierFill'); if (f) f.style.transform = `scaleX(${t.pct})`; });
   $$('[data-scope]').forEach(b => b.onclick = () => { if (S.search) return; S.scope = b.dataset.scope; localStorage.setItem('mog_scope', S.scope); $$('[data-scope]').forEach(x => x.setAttribute('aria-pressed', x === b)); SFX.click(); renderLaunch(); });
-  $$('[data-ranked]').forEach(b => b.onclick = () => { if (S.search) return; S.ranked = b.dataset.ranked === '1'; localStorage.setItem('mog_ranked', S.ranked ? '1' : '0'); $$('[data-ranked]').forEach(x => x.setAttribute('aria-pressed', x === b)); SFX.click(); renderLaunch(); });
-  $('#camOn').onclick = async () => { try { await ensureCamera(); attachPreview(); } catch (e) { toast('Разреши доступ к камере в настройках браузера', 'hot', 'camera-off'); } };
-  renderLaunch(); renderFeed(); updateChecks();
+  $$('[data-ranked]').forEach(b => b.onclick = () => { if (S.search) return; S.ranked = b.dataset.ranked === '1'; localStorage.setItem('mog_ranked', S.ranked ? '1' : '0'); $$('[data-ranked]').forEach(x => x.setAttribute('aria-pressed', x === b)); SFX.click(); renderLaunch(); renderDuel(); });
+  $('#camOn').onclick = async () => { try { await ensureCamera(); attachPreview(); } catch (e) { toast(tr('Разреши доступ к камере в настройках браузера'), 'hot', 'camera-off'); } };
+  renderLaunch(); renderDuel(); renderFeed(); updateChecks();
   if (camStream) attachPreview();
   else navigator.permissions?.query({ name: 'camera' }).then(r => { if (r.state === 'granted') ensureCamera().then(attachPreview).catch(() => {}); }).catch(() => {});
 }
@@ -1751,34 +2236,34 @@ function attachPreview() {
 }
 function setFace(ok) {
   $('#camSlot')?.classList.toggle('face-ok', ok);
-  const st = $('#camState'); if (st) st.textContent = ok ? 'Лицо в кадре' : 'Ищем лицо';
+  const st = $('#camState'); if (st) st.textContent = ok ? tr('Лицо в кадре') : tr('Ищем лицо');
   if (S.faceOk !== ok) { S.faceOk = ok; updateChecks(); }
 }
 function updateChecks() {
   const el = $('#checks'); if (!el) return;
   const items = [
-    [!!camStream, 'Камера', camStream ? 'включена' : 'нужна'],
-    [S.faceOk, 'Лицо в кадре', S.faceOk ? 'есть' : 'не видно'],
-    [S.model === 'ok', 'Разметка лица', { ok: 'готова', loading: 'грузится', err: 'ошибка' }[S.model] || 'ждёт'],
-    [!!(S.profile?.avatar_url && S.profile?.tags?.length), 'Аватар и теги', 'по желанию'],
+    [!!camStream, tr('Камера'), camStream ? tr('включена') : tr('нужна')],
+    [S.faceOk, tr('Лицо в кадре'), S.faceOk ? tr('есть') : tr('не видно')],
+    [S.model === 'ok', tr('Разметка лица'), { ok: tr('готова'), loading: tr('грузится'), err: tr('ошибка') }[S.model] || tr('ждёт')],
+    [!!(S.profile?.avatar_url && S.profile?.tags?.length), tr('Аватар и теги'), tr('по желанию')],
   ];
   el.innerHTML = items.map(([ok, n, s]) => `<li class="${ok ? 'ok' : 'bad'}"><i data-lucide="${ok ? 'check' : 'circle-dashed'}"></i><span>${n}</span><small>${s}</small></li>`).join('');
   icons();
 }
 
-const REEL = ['Сканируем арену', `±${CONFIG.ELO_RANGE} ELO`, 'Цифровые технологии', 'Медицина', 'Госуправление', 'Гуманитарии', 'Бизнес и маркетинг'];
+const REEL = () => [tr('Сканируем арену'), `±${CONFIG.ELO_RANGE} ELO`, tr('Цифровые технологии'), tr('Медицина'), tr('Госуправление'), tr('Гуманитарии'), tr('Бизнес и маркетинг')];
 function renderLaunch() {
   const w = $('#launchWrap'); if (!w) return;
   const p = S.profile, lo = p.elo - CONFIG.ELO_RANGE, hi = p.elo + CONFIG.ELO_RANGE;
-  const scopeTxt = S.scope === 'faculty' ? fac(p.faculty).short : 'все факультеты';
+  const scopeTxt = S.scope === 'faculty' ? fac(p.faculty).short : tr('все факультеты');
   if (!S.search) {
     w.innerHTML = `
     <button class="launch" id="launchBtn">
       <span class="launch-lines"></span>
       <i data-lucide="arrow-up-right" class="launch-arrow"></i>
-      <span class="launch-eyebrow">${S.ranked ? 'Рейтинговый бой' : 'Тренировка без ELO'} · ${scopeTxt}</span>
-      <span class="launch-title">В бой<br>лицом</span>
-      <span class="launch-foot"><span>Соперник строго <b>${lo}-${hi}</b> ELO</span><span class="kbd">Enter</span></span>
+      <span class="launch-eyebrow">${S.ranked ? tr('Рейтинговый бой') : tr('Тренировка без ELO')} · ${scopeTxt}</span>
+      <span class="launch-title">${tr('В бой')}<br>${tr('лицом')}</span>
+      <span class="launch-foot"><span>${tr('Соперник строго ')}<b>${lo}-${hi}</b> ELO</span><span class="kbd">Enter</span></span>
     </button>`;
     const b = $('#launchBtn');
     b.onclick = startSearch;
@@ -1787,24 +2272,24 @@ function renderLaunch() {
     w.innerHTML = `
     <div class="launch is-searching">
       <span class="scan-bars"></span><span class="radar"></span>
-      <span class="launch-eyebrow" style="color:var(--tx3)">Поиск соперника · ${scopeTxt}</span>
-      <div class="reel" id="reel"><span>${REEL[0]}</span></div>
+      <span class="launch-eyebrow" style="color:var(--tx3)">${tr('Поиск соперника')} · ${scopeTxt}</span>
+      <div class="reel" id="reel"><span>${REEL()[0]}</span></div>
       <div class="search-meta">
-        <div><span class="big mono" id="sTime">0:00</span><small>в очереди</small></div>
-        <div><b>${lo}-${hi}</b><small>окно ELO</small></div>
-        <div><b id="sOnline">${S.online}</b><small>онлайн</small></div>
+        <div><span class="big mono" id="sTime">0:00</span><small>${tr('в очереди')}</small></div>
+        <div><b>${lo}-${hi}</b><small>${tr('окно ELO')}</small></div>
+        <div><b id="sOnline">${S.online}</b><small>${tr('онлайн')}</small></div>
       </div>
-      <div class="launch-actions"><span class="muted" style="font-size:.85rem">Бой начнётся, только когда соперник зайдёт в комнату</span><button class="btn sm" id="cancelBtn">Отменить <span class="kbd">Esc</span></button></div>
+      <div class="launch-actions"><span class="muted" style="font-size:.85rem">${tr('Бой начнётся, только когда соперник зайдёт в комнату')}</span><button class="btn sm" id="cancelBtn">${tr('Отменить ')}<span class="kbd">Esc</span></button></div>
     </div>`;
     $('#cancelBtn').onclick = cancelSearch;
   } else {
     const o = S.search.match.opp;
     w.innerHTML = `
     <div class="launch is-found">
-      <span class="launch-eyebrow" style="color:var(--red-hi)">Соперник найден</span>
+      <span class="launch-eyebrow" style="color:var(--red-hi)">${tr('Соперник найден')}</span>
       <div class="found-wrap">${ava(o, 'xl')}<div><span class="launch-title found-name">${esc(o.display_name)}</span><span class="found-meta">${fac(o.faculty).name} · <b class="mono">${o.elo}</b> ELO · ${tierOf(o.elo).name}</span>${tagsHTML(o.tags, 4)}</div></div>
       <div class="found-bar"><i></i></div>
-      <div class="launch-actions"><span class="muted" style="font-size:.85rem">Заходим в комнату</span></div>
+      <div class="launch-actions"><span class="muted" style="font-size:.85rem">${tr('Заходим в комнату')}</span></div>
     </div>`;
   }
   icons();
@@ -1817,8 +2302,9 @@ function updateSearchMeta() {
 }
 async function startSearch() {
   if (S.search || S.battle) return;
+  if (S.duel) { toast(tr('Сначала отмени вызов другу')); return; }
   try { await ensureCamera(); attachPreview(); }
-  catch (e) { toast('Без камеры никак: разреши доступ в браузере', 'hot', 'camera-off'); return; }
+  catch (e) { toast(tr('Без камеры никак: разреши доступ в браузере'), 'hot', 'camera-off'); return; }
   loadLandmarker().catch(() => {});
   const ac = new AbortController();
   const me = S.search = { state: 'searching', t0: Date.now(), ac };
@@ -1827,7 +2313,7 @@ async function startSearch() {
   const iv = setInterval(() => {
     if (S.search !== me || me.state !== 'searching') return clearInterval(iv);
     updateSearchMeta();
-    if ((Date.now() - me.t0) % 1400 < 500) { ri = (ri + 1) % REEL.length; const r = $('#reel'); if (r) r.innerHTML = `<span>${REEL[ri]}</span>`; }
+    if ((Date.now() - me.t0) % 1400 < 500) { ri = (ri + 1) % REEL().length; const r = $('#reel'); if (r) r.innerHTML = `<span>${REEL()[ri]}</span>`; }
   }, 500);
   try {
     const m = await Net.findMatch({ userId: S.user.id, scope: S.scope, ranked: S.ranked, elo: S.profile.elo, faculty: S.profile.faculty }, ac.signal);
@@ -1838,20 +2324,229 @@ async function startSearch() {
     S.search = null; enterBattle(m);
   } catch (e) {
     console.error(e); if (S.search === me) { S.search = null; renderLaunch(); }
-    toast('Поиск упал: ' + (e.message || e), 'hot');
+    toast(tr('Поиск упал: ') + (e.message || e), 'hot');
   }
 }
 function cancelSearch() { if (!S.search || S.search.state !== 'searching') return; S.search.ac.abort(); S.search = null; renderLaunch(); }
+
+
+/* =================== friend battles: вызов по нику и приглашение по ссылке =================== */
+const INVITE_KEY = 'mog_invite';
+const pendingInvite = () => localStorage.getItem(INVITE_KEY) || '';
+const inviteLink = code => location.origin + location.pathname + '?c=' + encodeURIComponent(code);
+(function grabInviteFromUrl() {
+  try {
+    const u = new URL(location.href), c = u.searchParams.get('c');
+    if (c && /^[a-z0-9]{6,32}$/i.test(c)) localStorage.setItem(INVITE_KEY, c);
+    if (u.searchParams.has('c')) { u.searchParams.delete('c'); history.replaceState(null, '', u.pathname + u.search + u.hash); }
+  } catch (e) {}
+})();
+function chErr(e) {
+  const m = String(e?.message || e || '');
+  if (/could not find the function|does not exist|schema cache|relation .*challenges/i.test(m)) return tr('Вызовы не настроены: запусти обновлённый SQL из этого файла в Supabase.');
+  if (/user not found/i.test(m)) return tr('Игрок с таким ником не найден');
+  if (/self challenge/i.test(m)) return tr('Нельзя вызвать самого себя');
+  if (/expired/i.test(m)) return tr('Вызов истёк');
+  if (/not for you/i.test(m)) return tr('Этот вызов адресован другому игроку');
+  if (/challenge (closed|not found)/i.test(m)) return tr('Вызов уже неактуален');
+  if (/no profile/i.test(m)) return tr('Заполни профиль, чтобы выйти на арену');
+  return m || tr('Ошибка сети.');
+}
+const mmss = s => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+
+function renderDuel() {
+  const w = $('#duelWrap'); if (!w) return;
+  const D = S.duel;
+  if (!D) {
+    w.innerHTML = `
+    <div class="duo">
+      <div class="duo-head"><p class="eyebrow">${tr('Бой с другом')}</p><small>${S.ranked ? tr('Рейтинговый бой') : tr('Тренировка без ELO')}</small></div>
+      <form class="duo-row" id="duoForm" novalidate>
+        <input class="input" id="duoNick" maxlength="25" autocomplete="off" spellcheck="false" placeholder="${esc(tr('ник соперника, например @nick'))}">
+        <button class="btn" type="submit" id="duoGo"><i data-lucide="swords"></i>${tr('Вызвать')}</button>
+      </form>
+      <div class="duo-acts"><button class="btn ghost sm" type="button" id="duoLink"><i data-lucide="link"></i>${tr('Пригласить по ссылке')}</button></div>
+    </div>`;
+    $('#duoForm').onsubmit = e => {
+      e.preventDefault();
+      const n = cleanNick($('#duoNick').value).replace(/^@+/, '');
+      if (n.length < 2) { toast(tr('Впиши ник соперника'), 'hot'); $('#duoNick').focus(); return; }
+      createDuel(n, $('#duoGo'));
+    };
+    $('#duoLink').onclick = e => createDuel(null, e.currentTarget);
+  } else {
+    const left = Math.max(0, Math.ceil((D.expires - Date.now()) / 1000));
+    w.innerHTML = `
+    <div class="duo waiting">
+      <div class="duo-head"><p class="eyebrow">${D.to ? tr('Вызов отправлен') : tr('Приглашение по ссылке')}</p><small>${D.ranked ? tr('Рейтинговый бой') : tr('Тренировка без ELO')}</small></div>
+      <div class="duo-wait"><span class="pulse"></span><b>${D.to ? tr('Ждём ответа от @{nick}', { nick: esc(D.to) }) : tr('Ждём друга по ссылке')}</b><span class="mono muted" id="duoTime">${mmss(left)}</span></div>
+      ${D.to ? '' : `<div class="duo-row"><input class="input mono" id="duoUrl" readonly value="${esc(inviteLink(D.code))}"><button class="btn" type="button" id="duoCopy"><i data-lucide="copy"></i>${tr('Копировать')}</button></div>`}
+      <div class="duo-acts">
+        ${!D.to && navigator.share ? `<button class="btn sm" type="button" id="duoShare"><i data-lucide="share-2"></i>${tr('Поделиться')}</button>` : ''}
+        <button class="btn ghost sm" type="button" id="duoCancel">${tr('Отменить вызов')}</button>
+        <span class="muted" style="font-size:.85rem">${tr('Не закрывай вкладку: бой начнётся сам, как только друг примет')}</span>
+      </div>
+    </div>`;
+    $('#duoCancel').onclick = () => cancelDuel(true);
+    const cp = $('#duoCopy'); if (cp) cp.onclick = () => copyInvite(D);
+    const sh = $('#duoShare'); if (sh) sh.onclick = () => navigator.share({ title: 'FACEMATCH', text: tr('Го в FACEMATCH 1 на 1'), url: inviteLink(D.code) }).catch(() => {});
+    const u = $('#duoUrl'); if (u) u.onfocus = () => u.select();
+  }
+  icons();
+}
+async function copyInvite(D) {
+  try { await navigator.clipboard.writeText(inviteLink(D.code)); toast(tr('Ссылка скопирована. Скинь её другу'), '', 'check'); }
+  catch (e) { const i = $('#duoUrl'); if (i) { i.focus(); i.select(); } toast(tr('Скопируй ссылку вручную')); }
+}
+async function createDuel(nick, btn) {
+  if (S.battle) return;
+  if (S.duel) { toast(tr('Сначала отмени текущий вызов')); return; }
+  if (!USE_SB) { toast(tr('Бой с другом работает только с подключённой базой Supabase'), 'hot'); return; }
+  try { await ensureCamera(); attachPreview(); }
+  catch (e) { toast(tr('Без камеры никак: разреши доступ в браузере'), 'hot', 'camera-off'); return; }
+  loadLandmarker().catch(() => {});
+  if (S.search) cancelSearch();
+  btn?.classList.add('is-loading'); if (btn) btn.disabled = true;
+  try {
+    const c = await Net.createChallenge(nick, S.ranked);
+    if (!c?.id) throw new Error(tr('Ошибка сервера'));
+    const D = S.duel = { id: c.id, code: c.code, to: nick, ranked: !!c.ranked, expires: Date.now() + (nick ? 180 : 1800) * 1000 };
+    SFX.click(); renderDuel();
+    if (nick) toast(tr('Вызов отправлен @{nick}', { nick }), '', 'swords'); else copyInvite(D);
+    pollDuel(D);
+  } catch (e) {
+    toast(e.message || String(e), 'hot');
+  } finally {
+    btn?.classList.remove('is-loading'); if (btn) btn.disabled = false;
+  }
+}
+function pollDuel(D) {
+  const tick = async () => {
+    if (S.duel !== D) { clearInterval(D.iv); return; }
+    const left = Math.max(0, Math.ceil((D.expires - Date.now()) / 1000));
+    const el = $('#duoTime'); if (el) el.textContent = mmss(left);
+    if (!D.busy && Date.now() - (D.lastPoll || 0) >= 2000) {
+      D.busy = true; D.lastPoll = Date.now();
+      try {
+        const st = await Net.challengeState(D.id);
+        if (S.duel !== D) return;
+        if (st?.status === 'accepted' && st.match_id) { clearInterval(D.iv); S.duel = null; await startDuelBattle(st.match_id); return; }
+        if (!st || st.status === 'declined') { endDuel(D, D.to ? tr('@{nick} отказался от боя', { nick: D.to }) : tr('Вызов отменён')); return; }
+        if (st.status !== 'pending') { endDuel(D, tr('Вызов отменён')); return; }
+      } catch (e) { console.error(e); }
+      finally { D.busy = false; }
+    }
+    if (left <= 0 && S.duel === D) { Net.declineChallenge(D.id).catch(() => {}); endDuel(D, tr('Вызов истёк')); }
+  };
+  D.iv = setInterval(tick, 1000); tick();
+}
+function endDuel(D, msg) { clearInterval(D.iv); if (S.duel === D) S.duel = null; if (msg) toast(msg); renderDuel(); }
+function cancelDuel(manual) { const D = S.duel; if (!D) return; Net.declineChallenge(D.id).catch(() => {}); endDuel(D, manual ? tr('Вызов отменён') : ''); }
+async function startDuelBattle(mid) {
+  if (S.battle) { Net.cancelMatch(mid).catch(() => {}); return; }
+  if (S.search) cancelSearch();
+  try {
+    await ensureCamera();
+    const m = await Net.matchInfo(mid, S.user.id);
+    if (m.status !== 'pending') { toast(tr('Вызов уже неактуален')); renderDuel(); return; }
+    SFX.found(); toast(tr('{name} принял(а) вызов. В бой!', { name: m.opp.display_name }), 'hot', 'swords');
+    enterBattle(m);
+  } catch (e) {
+    console.error(e); Net.cancelMatch(mid).catch(() => {});
+    toast(e.message || String(e), 'hot'); renderDuel();
+  }
+}
+
+/* входящие вызовы */
+function renderInvites() {
+  let box = $('#invites');
+  if (!box) { box = document.createElement('div'); box.id = 'invites'; box.className = 'invites'; box.setAttribute('aria-live', 'polite'); document.body.appendChild(box); }
+  const list = [];
+  if (S.linkInv) list.push(S.linkInv);
+  S.incoming.forEach(c => { if (!list.some(x => x.code === c.code)) list.push(c); });
+  const show = S.profile && !S.battle ? list.filter(c => !S.dismissed.has(c.code)) : [];
+  const sig = LANG + '|' + show.map(c => c.code).join(',');
+  if (box.dataset.sig === sig) return;
+  box.dataset.sig = sig;
+  box.innerHTML = show.map(c => `
+    <div class="invite">
+      <div class="invite-who">${ava(c.from, 'lg')}<div style="min-width:0"><b>${esc(c.from?.display_name)}</b><small>${tr('вызывает тебя на бой')} · ${c.ranked ? tr('рейтинг') : tr('тренировка')} · <span class="mono">${esc(c.from?.elo ?? '')}</span> ELO</small></div></div>
+      <div class="invite-acts"><button class="btn primary sm" type="button" data-acc="${esc(c.code)}"><i data-lucide="swords"></i>${tr('Принять')}</button><button class="btn sm" type="button" data-dec="${esc(c.code)}">${tr('Отклонить')}</button></div>
+    </div>`).join('');
+  $$('[data-acc]', box).forEach(b => b.onclick = () => acceptInvite(b.dataset.acc, b));
+  $$('[data-dec]', box).forEach(b => b.onclick = () => declineInvite(b.dataset.dec));
+  icons();
+}
+function dropInvite(code) {
+  S.dismissed.add(code);
+  S.incoming = S.incoming.filter(c => c.code !== code);
+  if (S.linkInv?.code === code) S.linkInv = null;
+  if (pendingInvite() === code) localStorage.removeItem(INVITE_KEY);
+  renderInvites();
+}
+function declineInvite(code) {
+  const c = S.incoming.find(x => x.code === code);
+  if (c?.id) Net.declineChallenge(c.id).catch(() => {}); // ссылку-приглашение не гасим на сервере: её хозяин может отменить сам
+  SFX.click(); dropInvite(code);
+}
+async function acceptInvite(code, btn) {
+  if (S.battle) { toast(tr('Сначала выйди из комнаты')); return; }
+  try { await ensureCamera(); } catch (e) { toast(tr('Без камеры никак: разреши доступ в браузере'), 'hot', 'camera-off'); return; }
+  loadLandmarker().catch(() => {});
+  btn?.classList.add('is-loading'); if (btn) btn.disabled = true;
+  try {
+    if (S.search) cancelSearch();
+    if (S.duel) cancelDuel(false);
+    const mid = await Net.acceptChallenge(code);
+    dropInvite(code);
+    const m = await Net.matchInfo(mid, S.user.id);
+    SFX.found();
+    enterBattle(m);
+  } catch (e) {
+    console.error(e); toast(e.message || String(e), 'hot'); dropInvite(code);
+  } finally {
+    btn?.classList.remove('is-loading'); if (btn) btn.disabled = false;
+  }
+}
+let incomingIv = null;
+function startIncoming() {
+  if (incomingIv || !USE_SB) return;
+  const tick = async () => {
+    if (!S.profile || document.hidden) return;
+    try {
+      const list = (await Net.incoming(S.user.id)).map(c => ({ ...c, direct: true }));
+      const fresh = list.some(c => !S.incoming.some(x => x.code === c.code) && !S.dismissed.has(c.code));
+      S.incoming = list;
+      if (fresh && !S.battle) SFX.found();
+      renderInvites();
+    } catch (e) {
+      console.error(e);
+      if (!S.chWarned) { S.chWarned = true; toast(e.message || String(e), 'hot'); }
+    }
+  };
+  incomingIv = setInterval(tick, 4000); tick();
+}
+async function checkLinkInvite() {
+  const code = pendingInvite(); if (!code || !USE_SB) return;
+  try {
+    const c = await Net.peekChallenge(code);
+    if (!c) { localStorage.removeItem(INVITE_KEY); toast(tr('Приглашение не найдено')); return; }
+    if (c.from?.id === S.user.id) { localStorage.removeItem(INVITE_KEY); toast(tr('Это твоя ссылка-приглашение: отправь её другу')); return; }
+    if (c.status !== 'pending' || c.expired || !c.for_me) { localStorage.removeItem(INVITE_KEY); toast(tr('Приглашение уже неактуально'), 'hot'); return; }
+    S.linkInv = { id: c.id, code: c.code, ranked: c.ranked, from: c.from, direct: false };
+    SFX.found(); renderInvites();
+  } catch (e) { console.error(e); toast(e.message || String(e), 'hot'); }
+}
 
 /* feed */
 async function loadFeed() { try { S.feed = await Net.feed(); renderFeed(); } catch (e) { console.error(e); } }
 function renderFeed() {
   const ol = $('#feedList'); if (!ol) return;
-  if (!S.feed?.length) { ol.innerHTML = '<li class="quiet" style="border:0">Пока тихо. Сыграй первый бой, и он появится тут.</li>'; return; }
+  if (!S.feed?.length) { ol.innerHTML = `<li class="quiet" style="border:0">${tr('Пока тихо. Сыграй первый бой, и он появится тут.')}</li>`; return; }
   ol.innerHTML = S.feed.map((m, i) => {
     const aWin = m.winner === m.player_a, W = aWin ? m.a : m.b, L = aWin ? m.b : m.a;
     const ws = +(aWin ? m.score_a : m.score_b), ls = +(aWin ? m.score_b : m.score_a);
-    return `<li style="--i:${i}"><b>${esc(W?.display_name)}</b> замогал(а) <b>${esc(L?.display_name)}</b> <span class="v">${ws.toFixed(2)}:${ls.toFixed(2)}</span><span class="meta">${fac(W?.faculty).short} vs ${fac(L?.faculty).short} · ${timeAgo(m.judged_at)}</span></li>`;
+    return `<li style="--i:${i}"><b>${esc(W?.display_name)}</b>${tr(' замогал(а) ')}<b>${esc(L?.display_name)}</b> <span class="v">${ws.toFixed(2)}:${ls.toFixed(2)}</span><span class="meta">${fac(W?.faculty).short} vs ${fac(L?.faculty).short} · ${timeAgo(m.judged_at)}</span></li>`;
   }).join('');
 }
 function updateOnline() { const a = $('#onlineN'); if (a && a.textContent != S.online) { a.textContent = S.online; } const b = $('#sOnline'); if (b) b.textContent = S.online; }
@@ -1865,21 +2560,21 @@ function viewBattle() {
   $('#main').innerHTML = `
   <section class="battle view">
     <div class="battle-top">
-      <div><p class="eyebrow">${B.ranked ? 'Рейтинговый бой' : 'Тренировка'} · комната ${esc(B.id.slice(0, 6))}</p>
+      <div><p class="eyebrow">${B.ranked ? tr('Рейтинговый бой') : tr('Тренировка')} · ${tr('комната')} ${esc(B.id.slice(0, 6))}</p>
       <h1 class="h-page battle-h">${esc(me.display_name)} <span class="muted">vs</span> ${esc(op.display_name)}</h1></div>
-      <div class="room-status"><span class="dots" id="pDots"><i class="on"></i><i></i></span><span id="roomStatus">Ждём соперника · 1/2</span></div>
+      <div class="room-status"><span class="dots" id="pDots"><i class="on"></i><i></i></span><span id="roomStatus">${tr('Ждём соперника · 1/2')}</span></div>
     </div>
     <div class="stage">
-      <figure class="tile me connected" id="tileMe"><video id="vMe" autoplay muted playsinline></video><span class="viewfinder"></span><span class="scan"></span><span class="flash"></span>${cap(me, 'Ты · ' + fac(me.faculty).short)}</figure>
+      <figure class="tile me connected" id="tileMe"><video id="vMe" autoplay muted playsinline></video><span class="viewfinder"></span><span class="scan"></span><span class="flash"></span>${cap(me, tr('Ты · ') + fac(me.faculty).short)}</figure>
       <div class="mid">
         <div class="ring idle" id="ring"><svg viewBox="0 0 120 120"><circle class="bg" cx="60" cy="60" r="54"/><circle class="fg" id="ringFg" cx="60" cy="60" r="54" stroke-dasharray="339.29" stroke-dashoffset="0" transform="rotate(-90 60 60)"/></svg><b id="tNum">1/2</b></div>
-        <p class="mid-label" id="midLabel">Бой начнётся, когда соперник зайдёт в комнату</p>
+        <p class="mid-label" id="midLabel">${tr('Бой начнётся, когда соперник зайдёт в комнату')}</p>
       </div>
-      <figure class="tile opp" id="tileOpp"><video id="vOpp" autoplay playsinline></video><img id="relayOpp" class="relay-opp" alt=""><div class="tile-wait">${ava(op, 'xl')}<b>${esc(op.display_name)}</b><span id="oppWait">заходит в комнату…</span></div><span class="scan"></span><span class="flash"></span>${cap(op, fac(op.faculty).short)}</figure>
+      <figure class="tile opp" id="tileOpp"><video id="vOpp" autoplay playsinline></video><img id="relayOpp" class="relay-opp" alt=""><div class="tile-wait">${ava(op, 'xl')}<b>${esc(op.display_name)}</b><span id="oppWait">${tr('заходит в комнату…')}</span></div><span class="scan"></span><span class="flash"></span>${cap(op, fac(op.faculty).short)}</figure>
     </div>
     <div class="battle-foot">
-      <span class="tip"><i data-lucide="scan-face"></i>Лицо целиком в кадре, свет спереди, смотри в объектив</span>
-      <div class="controls"><button class="btn sm" id="micBtn"><i data-lucide="mic"></i>Микрофон</button><button class="btn ghost sm" id="leaveBtn">Выйти</button></div>
+      <span class="tip"><i data-lucide="scan-face"></i>${tr('Лицо целиком в кадре, свет спереди, смотри в объектив')}</span>
+      <div class="controls"><button class="btn sm" id="micBtn"><i data-lucide="mic"></i>${tr('Микрофон')}</button><button class="btn ghost sm" id="leaveBtn">${tr('Выйти')}</button></div>
     </div>
   </section>`;
 }
@@ -1888,16 +2583,16 @@ function renderRoomStatus(B) {
   const n = Math.min(2, B.present);
   $$('#pDots i').forEach((d, i) => d.classList.toggle('on', i < n));
   let txt, mid;
-  if (B.started) txt = 'Бой идёт';
-  else if (n < 2) { txt = 'Ждём соперника · 1/2'; mid = 'Бой начнётся, когда соперник зайдёт в комнату'; }
-  else if (!B.remoteOk && B.lastRelayAt && Date.now() - B.lastRelayAt < 2000) { txt = 'Оба здесь · видео через сеть'; mid = 'Показываем видеопоток через Realtime…'; }
-  else if (!B.remoteOk) { txt = 'Оба здесь · соединяем видео'; mid = 'Соединяем видеочат…'; }
-  else { txt = 'Оба здесь · старт'; mid = 'Сейчас начнём'; }
+  if (B.started) txt = tr('Бой идёт');
+  else if (n < 2) { txt = tr('Ждём соперника · 1/2'); mid = tr('Бой начнётся, когда соперник зайдёт в комнату'); }
+  else if (!B.remoteOk && B.lastRelayAt && Date.now() - B.lastRelayAt < 2000) { txt = tr('Оба здесь · видео через сеть'); mid = tr('Показываем видеопоток через Realtime…'); }
+  else if (!B.remoteOk) { txt = tr('Оба здесь · соединяем видео'); mid = tr('Соединяем видеочат…'); }
+  else { txt = tr('Оба здесь · старт'); mid = tr('Сейчас начнём'); }
   st.textContent = txt;
   if (!B.started) {
     $('#tNum').textContent = n + '/2';
     if (mid) $('#midLabel').textContent = mid;
-    const w = $('#oppWait'); if (w) w.textContent = n < 2 ? 'заходит в комнату…' : 'подключаем видео…';
+    const w = $('#oppWait'); if (w) w.textContent = n < 2 ? tr('заходит в комнату…') : tr('подключаем видео…');
     $('#tileOpp')?.classList.toggle('joined', n >= 2);
   }
 }
@@ -1907,13 +2602,13 @@ async function enterBattle(m) {
   clearTimeout(previewTimer);
   const B = S.battle = { ...m, meBefore: S.profile.elo, present: 1, remoteOk: false, oppReady: false, started: false, finished: false, timers: [], pendingIce: [], fallbackSet: false };
   lockNav(true); S.view = 'battle'; setNavOn('arena');
-  viewBattle(); icons();
+  viewBattle(); icons(); renderInvites();
   const vMe = $('#vMe'); vMe.srcObject = camStream; vMe.play().catch(() => {});
-  $('#leaveBtn').onclick = () => { toast('Ты вышел из комнаты'); abortBattle(B, false); };
+  $('#leaveBtn').onclick = () => { toast(tr('Ты вышел из комнаты')); abortBattle(B, false); };
   $('#micBtn').onclick = () => {
-    const a = camStream?.getAudioTracks()[0]; if (!a) { toast('Микрофон недоступен'); return; }
+    const a = camStream?.getAudioTracks()[0]; if (!a) { toast(tr('Микрофон недоступен')); return; }
     a.enabled = !a.enabled;
-    $('#micBtn').innerHTML = `<i data-lucide="${a.enabled ? 'mic' : 'mic-off'}"></i>${a.enabled ? 'Микрофон' : 'Без звука'}`; icons();
+    $('#micBtn').innerHTML = `<i data-lucide="${a.enabled ? 'mic' : 'mic-off'}"></i>${a.enabled ? tr('Микрофон') : tr('Без звука')}`; icons();
   };
   const room = B.room = Net.room(m.id, S.user.id);
   setupPeer(B);
@@ -1933,7 +2628,7 @@ async function enterBattle(m) {
   if (S.battle !== B) return;
   room.send('join', {});
   B.timers.push(setTimeout(() => {
-    if (S.battle === B && B.present < 2 && !B.started) { toast('Соперник не зашёл в комнату. Ищем другого'); abortBattle(B, true); }
+    if (S.battle === B && B.present < 2 && !B.started) { toast(B.challenge ? tr('Друг не зашёл в комнату. Бой отменён') : tr('Соперник не зашёл в комнату. Ищем другого')); abortBattle(B, !B.challenge); }
   }, 30000));
 }
 function onPresence(B, ids) {
@@ -1960,7 +2655,7 @@ function onPresence(B, ids) {
 }
 function oppLeft(B) {
   if (S.battle !== B || B.finished || B.oppShot) return;
-  toast('Соперник вышел из комнаты', '', 'door-open');
+  toast(tr('Соперник вышел из комнаты'), '', 'door-open');
   abortBattle(B, false);
 }
 function abortBattle(B, research) {
@@ -2001,7 +2696,7 @@ function setupPeer(B) {
     }
     if ((pc.connectionState === 'failed' || pc.connectionState === 'disconnected') && !B.started) {
       startRelay(B);
-      toast('P2P-видео не соединилось. Бой всё равно начнётся');
+      toast(tr('P2P-видео не соединилось. Бой всё равно начнётся'));
     }
   };
 }
@@ -2059,7 +2754,7 @@ function onRelayFrame(B, d) {
   if (tile && !B.remoteOk) {
     tile.classList.add('relay');
     tile.classList.remove('connected');
-    const wait = $('#oppWait'); if (wait) wait.textContent = 'видео через сеть…';
+    const wait = $('#oppWait'); if (wait) wait.textContent = tr('видео через сеть…');
   }
   renderRoomStatus(B);
 }
@@ -2075,11 +2770,11 @@ async function startCountdown(B) {
   ring.classList.remove('idle');
   for (const n of [3, 2, 1]) {
     if (S.battle !== B) return;
-    num.textContent = n; pop(); label.textContent = 'Приготовься'; SFX.count();
+    num.textContent = n; pop(); label.textContent = tr('Приготовься'); SFX.count();
     await sleep(800);
   }
   if (S.battle !== B) return;
-  SFX.go(); label.textContent = 'Смотри в камеру и держи лицо';
+  SFX.go(); label.textContent = tr('Смотри в камеру и держи лицо');
   $('#tileMe').classList.add('hot'); $('#tileOpp').classList.add('hot');
   const dur = CONFIG.BATTLE_SECONDS * 1000, t0 = Date.now(), C = 339.29;
   let last = null;
@@ -2090,7 +2785,7 @@ async function startCountdown(B) {
       fg.style.strokeDashoffset = (C * Math.min(1, el / dur)).toFixed(2);
       if (sec !== last) {
         last = sec; num.textContent = sec;
-        if (sec <= 3 && sec > 0) { ring.classList.add('hot'); pop(); SFX.tick(); label.textContent = 'Не моргай'; }
+        if (sec <= 3 && sec > 0) { ring.classList.add('hot'); pop(); SFX.tick(); label.textContent = tr('Не моргай'); }
       }
       if (left <= 0) { clearInterval(iv); res(); }
     }, 40);
@@ -2104,10 +2799,10 @@ async function capture(B) {
   const tMe = $('#tileMe'), tOpp = $('#tileOpp'), ring = $('#ring');
   [tMe, tOpp].forEach(t => { t.classList.remove('shot', 'hot'); void t.offsetWidth; t.classList.add('shot', 'analyzing'); });
   ring.classList.remove('hot'); ring.classList.add('idle');
-  $('#tNum').textContent = 'AI'; $('#midLabel').textContent = 'Снимок сделан. Размечаем лица…';
+  $('#tNum').textContent = 'AI'; $('#midLabel').textContent = tr('Снимок сделан. Размечаем лица…');
   SFX.shutter();
   const local = grab($('#vMe')), remote = B.remoteOk ? grab($('#vOpp')) : null;
-  try { await withTimeout(loadLandmarker(), 25000); } catch (e) { toast('Модель разметки не загрузилась', 'hot'); }
+  try { await withTimeout(loadLandmarker(), 25000); } catch (e) { toast(tr('Модель разметки не загрузилась'), 'hot'); }
   if (S.battle !== B) return;
   const mine = analyze(local);
   const shot = { score: mine.score, cats: mine.cats, noFace: mine.noFace, lm: mine.lm, img: toJpeg(local) };
@@ -2117,7 +2812,7 @@ async function capture(B) {
   B.timers.push(setTimeout(() => {
     if (S.battle !== B || B.finished || B.oppShot) return;
     if (B.witness && !B.witness.noFace) { B.oppShot = { ...B.witness, fromWitness: true }; maybeFinish(B); }
-    else { toast('Не получили снимок соперника. Матч отменён'); abortBattle(B, false); }
+    else { toast(tr('Не получили снимок соперника. Матч отменён')); abortBattle(B, false); }
   }, 15000));
   maybeFinish(B);
 }
@@ -2143,16 +2838,16 @@ async function maybeFinish(B) {
   applyElo(B, before, after, winFinal, iWin, !res);
   updateMe(true);
   const achAfter = achSet(S.profile);
-  ACH.filter(a => achAfter.has(a.id) && !achBefore.has(a.id)).forEach((a, i) => setTimeout(() => { toast('Ачивка: ' + a.n, 'hot', a.ic); SFX.ach(); confetti(60, .15, .9); }, 3200 + i * 900));
+  ACH.filter(a => achAfter.has(a.id) && !achBefore.has(a.id)).forEach((a, i) => setTimeout(() => { toast(tr('Ачивка: ') + a.n, 'hot', a.ic); SFX.ach(); confetti(60, .15, .9); }, 3200 + i * 900));
   const tAfter = tierOf(S.profile.elo);
-  if (tAfter.idx > tierBefore) setTimeout(() => { const v = $('#verdict'); if (v) v.insertAdjacentHTML('beforeend', `<span class="tierup">Новый ранг: ${tAfter.name}</span>`); confetti(140, .5, .2); SFX.ach(); }, 2800);
+  if (tAfter.idx > tierBefore) setTimeout(() => { const v = $('#verdict'); if (v) v.insertAdjacentHTML('beforeend', `<span class="tierup">${tr('Новый ранг:')} ${tAfter.name}</span>`); confetti(140, .5, .2); SFX.ach(); }, 2800);
   setTimeout(() => { if (S.lastRoom === B.room) { S.lastRoom = null; B.room.leave(); } }, 8000);
 }
 
 function sideHTML(key, prof, shot, other, win) {
   return `
   <div class="side ${key}-side ${win ? 'win' : ''}" id="side-${key}">
-    <div class="shot"><canvas id="cv-${key}"></canvas>${shot.noFace ? '<span class="noface">Лицо не найдено</span>' : ''}<span class="stamp" id="stamp-${key}">MOGGED</span></div>
+    <div class="shot"><canvas id="cv-${key}"></canvas>${shot.noFace ? `<span class="noface">${tr('Лицо не найдено')}</span>` : ''}<span class="stamp" id="stamp-${key}">MOGGED</span></div>
     <div class="side-head">
       <div class="who">${ava(prof)}<div><b>${esc(prof.display_name)}</b><small>${fac(prof.faculty).short} · ${prof.elo} ELO</small></div></div>
       <b class="score" data-to="${shot.score}">0.00</b>
@@ -2165,19 +2860,19 @@ function renderResult(B, my, opp, iWin, corrected) {
   $('#main').innerHTML = `
   <section class="result view">
     <div class="verdict ${iWin ? 'win' : 'lose'}" id="verdict">
-      <p class="eyebrow">${B.ranked ? 'Рейтинговый бой' : 'Тренировка'} · vs ${esc(B.opp.display_name)}</p>
-      <h1 class="verdict-title" id="vTitle">${iWin ? 'Победа' : 'Замогали'}</h1>
-      <p class="elo-line"><span class="now" id="eloNow">${B.meBefore}</span><b class="d" id="eloD">считаем ELO…</b></p>
+      <p class="eyebrow">${B.ranked ? tr('Рейтинговый бой') : tr('Тренировка')} · vs ${esc(B.opp.display_name)}</p>
+      <h1 class="verdict-title" id="vTitle">${iWin ? tr('Победа') : tr('Замогали')}</h1>
+      <p class="elo-line"><span class="now" id="eloNow">${B.meBefore}</span><b class="d" id="eloD">${tr('считаем ELO…')}</b></p>
     </div>
     <div class="duel" id="duel">
       ${sideHTML('me', S.profile, my, opp, iWin)}
       <div class="vs-col">VS</div>
       ${sideHTML('opp', B.opp, opp, my, !iWin)}
     </div>
-    ${corrected ? '<p class="flag center">Счёт соперника пересчитан по видеопотоку: присланный снимок не совпал с трансляцией</p>' : ''}
+    ${corrected ? `<p class="flag center">${tr('Счёт соперника пересчитан по видеопотоку: присланный снимок не совпал с трансляцией')}</p>` : ''}
     <div class="result-actions">
-      <button class="btn primary" id="againBtn"><i data-lucide="swords"></i>Ещё бой <span class="kbd">R</span></button>
-      <button class="btn" id="arenaBtn">В арену</button>
+      <button class="btn primary" id="againBtn"><i data-lucide="swords"></i>${tr('Ещё бой ')}<span class="kbd">R</span></button>
+      <button class="btn" id="arenaBtn">${tr('В арену')}</button>
     </div>
   </section>`;
   icons();
@@ -2203,12 +2898,12 @@ function renderResult(B, my, opp, iWin, corrected) {
 }
 function applyElo(B, before, after, winFinal, localWin, pending) {
   const el = $('#eloNow'), dl = $('#eloD'); if (!el) return;
-  if (!B.ranked) { el.textContent = after; dl.textContent = 'тренировка, без ELO'; dl.className = 'd'; }
-  else if (pending && before === after) { el.textContent = after; dl.textContent = 'ELO обновится после подтверждения'; dl.className = 'd'; }
+  if (!B.ranked) { el.textContent = after; dl.textContent = tr('тренировка, без ELO'); dl.className = 'd'; }
+  else if (pending && before === after) { el.textContent = after; dl.textContent = tr('ELO обновится после подтверждения'); dl.className = 'd'; }
   else { const d = after - before; dl.textContent = (d >= 0 ? '+' : '') + d; dl.className = 'd ' + (d >= 0 ? 'up' : 'down'); countUp(el, before, after, 1600); }
   if (winFinal !== localWin) {
     const v = $('#verdict'), t = $('#vTitle');
-    v.className = 'verdict ' + (winFinal ? 'win' : 'lose'); t.textContent = winFinal ? 'Победа' : 'Замогали';
+    v.className = 'verdict ' + (winFinal ? 'win' : 'lose'); t.textContent = winFinal ? tr('Победа') : tr('Замогали');
   }
 }
 function again() { go('arena'); setTimeout(startSearch, 350); }
@@ -2219,14 +2914,14 @@ async function viewBoard() {
   $('#main').innerHTML = `
   <section class="board view">
     <div class="board-head">
-      <div><p class="eyebrow">Рейтинг</p><h1 class="h-page">Таблица ELO</h1></div>
+      <div><p class="eyebrow">${tr('Рейтинг')}</p><h1 class="h-page">${tr('Таблица ELO')}</h1></div>
       <div class="seg" id="facSeg">
-        <button data-f="all" aria-pressed="${boardFac === 'all'}">Все</button>
+        <button data-f="all" aria-pressed="${boardFac === 'all'}">${tr('Все')}</button>
         ${FACULTIES.map(f => `<button data-f="${f.id}" title="${f.name}" aria-pressed="${boardFac === f.id}">${f.short}</button>`).join('')}
       </div>
     </div>
     <div>
-      <div class="row-head"><span>#</span><span></span><span>Игрок</span><span class="fc">Факультет</span><span class="wl">W / L</span><span>ELO</span></div>
+      <div class="row-head"><span>#</span><span></span><span>${tr('Игрок')}</span><span class="fc">${tr('Факультет')}</span><span class="wl">W / L</span><span>ELO</span></div>
       <ol class="rows" id="boardRows">${'<li class="skel"></li>'.repeat(6)}</ol>
     </div>
   </section>`;
@@ -2234,16 +2929,17 @@ async function viewBoard() {
   try {
     const rows = await Net.leaderboard(boardFac);
     const ol = $('#boardRows'); if (!ol || S.view !== 'board') return;
-    if (!rows.length) { ol.outerHTML = `<div class="empty-state"><b>Здесь пока никого</b><span>Первый бой на этом факультете, и ты сразу в топе.</span><button class="btn primary sm" onclick="document.querySelector('[data-go=arena]').click()">В арену</button></div>`; return; }
+    if (!rows.length) { ol.outerHTML = `<div class="empty-state"><b>${tr('Здесь пока никого')}</b><span>${tr('Первый бой на этом факультете, и ты сразу в топе.')}</span><button class="btn primary sm" onclick="document.querySelector('[data-go=arena]').click()">${tr('В арену')}</button></div>`; return; }
     ol.innerHTML = rows.map((p, i) => `
       <li class="row ${i < 3 ? 'top' : ''} ${p.id === S.user.id ? 'me' : ''}" style="--i:${i}">
         <span class="rk">${i + 1}</span>${ava(p)}
-        <span class="nm"><b>${esc(p.display_name)}${p.streak >= 3 ? ' 🔥' : ''}</b><small>@${esc(p.username)}</small>${tagsHTML(p.tags, 3)}</span>
+        <span class="nm"><b>${esc(p.display_name)}${p.streak >= 3 ? ' 🔥' : ''}</b><small>@${esc(p.username)}${p.id !== S.user.id && USE_SB ? ` · <a class="linkish" data-ch="${esc(p.username)}">${tr('вызвать')}</a>` : ''}</small>${tagsHTML(p.tags, 3)}</span>
         <span class="fc">${fac(p.faculty).short}</span>
         <span class="wl mono">${p.wins} / ${p.losses}</span>
         <span class="el">${p.elo}</span>
       </li>`).join('');
-  } catch (e) { const ol = $('#boardRows'); if (ol) ol.innerHTML = `<li class="empty-state"><b>Не загрузилось</b><span>${esc(e.message)}</span></li>`; }
+    $$('[data-ch]', ol).forEach(a => a.onclick = () => { SFX.click(); const n = a.dataset.ch; go('arena'); createDuel(n, null); });
+  } catch (e) { const ol = $('#boardRows'); if (ol) ol.innerHTML = `<li class="empty-state"><b>${tr('Не загрузилось')}</b><span>${esc(e.message)}</span></li>`; }
 }
 
 /* =================== history =================== */
@@ -2251,7 +2947,7 @@ async function viewHistory() {
   $('#main').innerHTML = `
   <section class="board view">
     <div class="board-head">
-      <div><p class="eyebrow">История</p><h1 class="h-page">Твои бои</h1></div>
+      <div><p class="eyebrow">${tr('История')}</p><h1 class="h-page">${tr('Твои бои')}</h1></div>
       <div class="summary" id="hSum"></div>
     </div>
     <ol class="rows" id="hRows">${'<li class="skel"></li>'.repeat(5)}</ol>
@@ -2259,7 +2955,7 @@ async function viewHistory() {
   try {
     const uid = S.user.id, rows = await Net.history(uid);
     const ol = $('#hRows'); if (!ol || S.view !== 'history') return;
-    if (!rows.length) { ol.outerHTML = `<div class="empty-state"><b>Боёв пока нет</b><span>Включи камеру и жми «В бой». Соперник подбирается в пределах ±${CONFIG.ELO_RANGE} ELO.</span><button class="btn primary sm" onclick="document.querySelector('[data-go=arena]').click()">В арену</button></div>`; return; }
+    if (!rows.length) { ol.outerHTML = `<div class="empty-state"><b>${tr('Боёв пока нет')}</b><span>${tr('Включи камеру и жми «В бой». Соперник подбирается в пределах ±{r} ELO.', { r: CONFIG.ELO_RANGE })}</span><button class="btn primary sm" onclick="document.querySelector('[data-go=arena]').click()">${tr('В арену')}</button></div>`; return; }
     let w = 0;
     ol.innerHTML = rows.map((m, i) => {
       const meA = m.player_a === uid, o = meA ? m.b : m.a, win = m.winner === uid; if (win) w++;
@@ -2267,14 +2963,14 @@ async function viewHistory() {
       const d = m.ranked ? (meA ? m.elo_a_after - m.elo_a_before : m.elo_b_after - m.elo_b_before) : null;
       return `<li class="row hrow" style="--i:${i}">
         <span class="res ${win ? 'w' : 'l'}">${win ? 'WIN' : 'LOSS'}</span>${ava(o)}
-        <span class="nm"><b>vs ${esc(o?.display_name)}</b><small>${fac(o?.faculty).short}${m.ranked ? '' : ' · тренировка'}</small></span>
+        <span class="nm"><b>vs ${esc(o?.display_name)}</b><small>${fac(o?.faculty).short}${m.ranked ? '' : tr(' · тренировка')}</small></span>
         <span class="sc">${ms.toFixed(2)} : ${os.toFixed(2)}</span>
         <span class="dl ${d == null ? '' : d >= 0 ? 'up' : 'down'}">${d == null ? '·' : (d >= 0 ? '+' : '') + d}</span>
         <span class="ago">${timeAgo(m.judged_at)}</span>
       </li>`;
     }).join('');
     $('#hSum').innerHTML = `<span><b>${w}</b> W</span><span><b>${rows.length - w}</b> L</span>`;
-  } catch (e) { const ol = $('#hRows'); if (ol) ol.innerHTML = `<li class="empty-state"><b>Не загрузилось</b><span>${esc(e.message)}</span></li>`; }
+  } catch (e) { const ol = $('#hRows'); if (ol) ol.innerHTML = `<li class="empty-state"><b>${tr('Не загрузилось')}</b><span>${esc(e.message)}</span></li>`; }
 }
 
 /* =================== profile =================== */
@@ -2298,52 +2994,52 @@ function viewProfile() {
     <div class="prof-left">
       <label class="ava-edit" id="avaEdit">
         <span id="avaBox">${p.avatar_url ? `<img src="${esc(p.avatar_url)}" alt="">` : `<span class="ini">${esc(initials(p.display_name || '?'))}</span>`}</span>
-        <span class="over"><i data-lucide="image-up"></i>Сменить аву</span>
-        <input type="file" accept="image/*" id="avaInput" aria-label="Загрузить аватар">
+        <span class="over"><i data-lucide="image-up"></i>${tr('Сменить аву')}</span>
+        <input type="file" accept="image/*" id="avaInput" aria-label="${tr('Загрузить аватар')}">
       </label>
       <div class="prof-id">
-        <h2>${isNew ? 'Новый боец' : esc(p.display_name)}</h2>
-        <p>${isNew ? 'Заполни профиль, чтобы выйти на арену' : `@${esc(p.username)} · ${fac(p.faculty).name}`}</p>
+        <h2>${isNew ? tr('Новый боец') : esc(p.display_name)}</h2>
+        <p>${isNew ? tr('Заполни профиль, чтобы выйти на арену') : `@${esc(p.username)} · ${fac(p.faculty).name}`}</p>
         <span class="tier-badge">${t.name}</span>
       </div>
       <dl class="statlist">
-        <div><dt>ELO</dt><dd>${p.elo}</dd></div><div><dt>Пик</dt><dd>${p.peak_elo}</dd></div>
-        <div><dt>Победы</dt><dd>${p.wins}</dd></div><div><dt>Поражения</dt><dd>${p.losses}</dd></div>
-        <div><dt>Винрейт</dt><dd>${total ? Math.round(p.wins / total * 100) : 0}%</dd></div><div><dt>Лучшая серия</dt><dd>${p.best_streak}</dd></div>
+        <div><dt>ELO</dt><dd>${p.elo}</dd></div><div><dt>${tr('Пик')}</dt><dd>${p.peak_elo}</dd></div>
+        <div><dt>${tr('Победы')}</dt><dd>${p.wins}</dd></div><div><dt>${tr('Поражения')}</dt><dd>${p.losses}</dd></div>
+        <div><dt>${tr('Винрейт')}</dt><dd>${total ? Math.round(p.wins / total * 100) : 0}%</dd></div><div><dt>${tr('Лучшая серия')}</dt><dd>${p.best_streak}</dd></div>
       </dl>
       <div class="ach-block">
-        <div class="ach-title"><span class="eyebrow">Ачивки</span><span class="mono muted" style="font-size:.8rem">${got.size}/${ACH.length}</span></div>
+        <div class="ach-title"><span class="eyebrow">${tr('Ачивки')}</span><span class="mono muted" style="font-size:.8rem">${got.size}/${ACH.length}</span></div>
         <ul class="ach" style="margin-top:12px">${ACH.map(a => `<li class="${got.has(a.id) ? 'got' : ''}"><span class="ic"><i data-lucide="${a.ic}"></i></span><span><b>${a.n}</b>${a.d}</span></li>`).join('')}</ul>
       </div>
     </div>
     <form class="prof-form" id="profForm" novalidate>
-      <div><p class="eyebrow">${isNew ? 'Шаг 1 из 1' : 'Настройки'}</p><h1 class="h-page">${isNew ? 'Заверши профиль' : 'Профиль'}</h1></div>
+      <div><p class="eyebrow">${isNew ? tr('Шаг 1 из 1') : tr('Настройки')}</p><h1 class="h-page">${isNew ? tr('Заверши профиль') : tr('Профиль')}</h1></div>
       <div class="row2">
-        <div class="field"><label for="pName">Имя</label><input class="input" id="pName" maxlength="32" value="${esc(form.display_name)}"></div>
-        <div class="field"><label for="pUser">Юзернейм</label><input class="input" id="pUser" maxlength="20" value="${esc(form.username)}"></div>
+        <div class="field"><label for="pName">${tr('Имя')}</label><input class="input" id="pName" maxlength="32" value="${esc(form.display_name)}"></div>
+        <div class="field"><label for="pUser">${tr('Юзернейм')}</label><input class="input" id="pUser" maxlength="20" value="${esc(form.username)}"></div>
       </div>
-      <div class="field"><label for="pFac">Факультет</label>
-        <select class="select" id="pFac"><option value="">Выбери факультет</option>${FACULTIES.map(f => `<option value="${f.id}" ${form.faculty === f.id ? 'selected' : ''}>${f.name}</option>`).join('')}</select>
+      <div class="field"><label for="pFac">${tr('Факультет')}</label>
+        <select class="select" id="pFac"><option value="">${tr('Выбери факультет')}</option>${FACULTIES.map(f => `<option value="${f.id}" ${form.faculty === f.id ? 'selected' : ''}>${f.name}</option>`).join('')}</select>
       </div>
-      <div class="field"><label for="pBio">О себе</label><textarea class="input" id="pBio" maxlength="160" placeholder="Пара слов, которые увидит соперник">${esc(form.bio)}</textarea><span class="counter" id="bioCnt">${(form.bio || '').length}/160</span></div>
+      <div class="field"><label for="pBio">${tr('О себе')}</label><textarea class="input" id="pBio" maxlength="160" placeholder="${tr('Пара слов, которые увидит соперник')}">${esc(form.bio)}</textarea><span class="counter" id="bioCnt">${(form.bio || '').length}/160</span></div>
       <div class="field">
-        <span class="lbl">Теги · до 6</span>
+        <span class="lbl">${tr('Теги · до 6')}</span>
         <div class="tag-input" id="tagBox"></div>
         <div class="sugg" id="tagSugg"></div>
       </div>
       <p class="err" id="profErr"></p>
       <div class="form-actions">
-        <button class="btn primary" id="saveBtn">${isNew ? 'На арену' : 'Сохранить'}<i data-lucide="${isNew ? 'arrow-right' : 'check'}"></i></button>
-        <button class="btn ghost" type="button" id="outBtn"><i data-lucide="log-out"></i>Выйти</button>
+        <button class="btn primary" id="saveBtn">${isNew ? tr('На арену') : tr('Сохранить')}<i data-lucide="${isNew ? 'arrow-right' : 'check'}"></i></button>
+        <button class="btn ghost" type="button" id="outBtn"><i data-lucide="log-out"></i>${tr('Выйти|logout')}</button>
       </div>
     </form>
   </section>`;
   icons();
 
   const renderTags = () => {
-    $('#tagBox').innerHTML = form.tags.map((t, i) => `<span class="chip">#${esc(t)}<button type="button" data-rm="${i}" aria-label="Убрать"><i data-lucide="x"></i></button></span>`).join('') +
-      (form.tags.length < 6 ? `<input id="tagIn" placeholder="${form.tags.length ? 'ещё тег' : 'например gym, кодинг'}" maxlength="20">` : '');
-    $('#tagSugg').innerHTML = form.tags.length < 6 ? TAG_SUGGEST.filter(s => !form.tags.includes(s)).slice(0, 8).map(s => `<button type="button" data-add="${esc(s)}">+ ${esc(s)}</button>`).join('') : '';
+    $('#tagBox').innerHTML = form.tags.map((t, i) => `<span class="chip">#${esc(t)}<button type="button" data-rm="${i}" aria-label="${tr('Убрать')}"><i data-lucide="x"></i></button></span>`).join('') +
+      (form.tags.length < 6 ? `<input id="tagIn" placeholder="${form.tags.length ? tr('ещё тег') : tr('например gym, кодинг')}" maxlength="20">` : '');
+    $('#tagSugg').innerHTML = form.tags.length < 6 ? tagSuggest().filter(s => !form.tags.includes(s)).slice(0, 8).map(s => `<button type="button" data-add="${esc(s)}">+ ${esc(s)}</button>`).join('') : '';
     icons();
     const inp = $('#tagIn');
     if (inp) inp.onkeydown = e => {
@@ -2359,15 +3055,15 @@ function viewProfile() {
 
   $('#avaInput').onchange = async e => {
     const f = e.target.files?.[0]; if (!f) return;
-    if (!f.type.startsWith('image/')) { toast('Нужна картинка', 'hot'); return; }
+    if (!f.type.startsWith('image/')) { toast(tr('Нужна картинка'), 'hot'); return; }
     const box = $('#avaEdit'); box.classList.add('busy');
     try {
       const blob = await cropAvatar(f);
       const url = await Net.uploadAvatar(S.user.id, blob);
       form.avatar_url = url;
       $('#avaBox').innerHTML = `<img src="${esc(url)}" alt="">`;
-      if (!isNew) { S.profile = await Net.saveProfile(S.user.id, { avatar_url: url }, false); updateMe(); toast('Ава обновлена', '', 'check'); }
-    } catch (ex) { toast('Не загрузилось: ' + ex.message, 'hot'); }
+      if (!isNew) { S.profile = await Net.saveProfile(S.user.id, { avatar_url: url }, false); updateMe(); toast(tr('Ава обновлена'), '', 'check'); }
+    } catch (ex) { toast(tr('Не загрузилось: ') + ex.message, 'hot'); }
     box.classList.remove('busy');
   };
   $('#outBtn').onclick = async () => { await Net.signOut(); location.reload(); };
@@ -2381,13 +3077,13 @@ function viewProfile() {
       bio: $('#pBio').value.trim(), tags: form.tags, avatar_url: form.avatar_url || null,
     };
     const bad = (id, m) => { $(id).setAttribute('aria-invalid', 'true'); err.textContent = m; $(id).focus(); };
-    if (patch.display_name.length < 2) return bad('#pName', 'Имя: от 2 символов');
-    if (!/^[a-zA-Z0-9_.]{3,20}$/.test(patch.username)) return bad('#pUser', 'Юзернейм: 3-20 символов, латиница, цифры, _ и .');
-    if (!patch.faculty) return bad('#pFac', 'Выбери факультет');
+    if (patch.display_name.length < 2) return bad('#pName', tr('Имя: от 2 символов'));
+    if (!/^[a-zA-Z0-9_.]{3,20}$/.test(patch.username)) return bad('#pUser', tr('Юзернейм: 3-20 символов, латиница, цифры, _ и .'));
+    if (!patch.faculty) return bad('#pFac', tr('Выбери факультет'));
     btn.classList.add('is-loading');
     try {
       S.profile = await Net.saveProfile(S.user.id, patch, isNew);
-      updateMe(true); toast(isNew ? 'Профиль готов. Погнали' : 'Сохранено', '', 'check');
+      updateMe(true); toast(isNew ? tr('Профиль готов. Погнали') : tr('Сохранено'), '', 'check');
       if (isNew) { lockNav(false); startLive(); confetti(120, .5, .3); SFX.win(); go('arena'); }
       else { btn.classList.remove('is-loading'); viewProfile(); }
     } catch (ex) { btn.classList.remove('is-loading'); err.textContent = ex.message; }
@@ -2400,6 +3096,8 @@ function startLive() {
   Net.lobby(S.user.id, n => { S.online = n; updateOnline(); });
   Net.onFeed(() => loadFeed());
   loadFeed();
+  startIncoming();
+  checkLinkInvite();
   loadLandmarker().catch(() => {});
 }
 async function boot() {
@@ -2425,6 +3123,7 @@ document.addEventListener('keydown', e => {
   if (S.view === 'result' && (e.key.toLowerCase() === 'r' || e.key.toLowerCase() === 'к')) again();
 });
 addEventListener('beforeunload', () => {
+  if (S.duel && USE_SB && sb) sb.rpc('decline_challenge', { p_id: S.duel.id }).catch(() => {});
   try { S.battle?.room?.send('bye', {}); S.battle?.room?.leave(); } catch (e) {}
   if (S.search) {
     S.search.ac.abort();
