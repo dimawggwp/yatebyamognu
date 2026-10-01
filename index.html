@@ -2683,7 +2683,7 @@ async function enterBattle(m) {
   room.on('go', () => { if (B.role === 'b') startCountdown(B); });
   room.on('shot', d => { B.oppShot = d; maybeFinish(B); });
   room.on('bye', () => oppLeft(B));
-  room.on('rx', d => { if (S.battle === B && d && RX_MAP[d.k]) rxBurst(d.k, false); });
+  room.on('rx', d => rxRecv(B, d));
   room.on('cam', d => {
     if (S.battle !== B) return;
     const off = d && d.on === false;
@@ -2790,6 +2790,12 @@ function rxLayer() {
   if (!l) { l = document.createElement('div'); l.id = 'rxLayer'; l.setAttribute('aria-hidden', 'true'); document.body.appendChild(l); }
   return l;
 }
+/* реакция от соперника: приходит и через Realtime, и через P2P-канал, дубли отсекаются */
+function rxRecv(B, d) {
+  if (S.battle !== B || !d || !RX_MAP[d.k]) return;
+  if (d.id) { B.rxSeen ||= new Set(); if (B.rxSeen.has(d.id)) return; B.rxSeen.add(d.id); }
+  rxBurst(d.k, false);
+}
 function rxBurst(k, mine) {
   const r = RX_MAP[k], tile = $(mine ? '#tileMe' : '#tileOpp'); if (!r || !tile) return;
   const L = rxLayer(); if (L.childElementCount > 60) return;
@@ -2845,7 +2851,9 @@ function setupReactions(B) {
     const k = b.dataset.rx;
     b.animate([{ transform: 'scale(.8)' }, { transform: 'scale(1.35)' }, { transform: 'scale(1)' }], { duration: 380, easing: 'cubic-bezier(.34,1.56,.64,1)' });
     rxBurst(k, true);
-    try { B.room?.send('rx', { k }); } catch (err) {}
+    const msg = { k, id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8) };
+    try { Promise.resolve(B.room?.send('rx', msg)).catch(() => {}); } catch (err) {}
+    try { if (B.rxDc?.readyState === 'open') B.rxDc.send(JSON.stringify(msg)); } catch (err) {}
   };
   const close = e => {
     if (S.battle !== B || !document.body.contains(tray)) { document.removeEventListener('click', close); document.removeEventListener('keydown', esc); return; }
@@ -2858,6 +2866,10 @@ function setupReactions(B) {
 /* WebRTC */
 function setupPeer(B) {
   const pc = B.pc = new RTCPeerConnection({ iceServers: CONFIG.ICE });
+  try {
+    const dc = B.rxDc = pc.createDataChannel('rx', { negotiated: true, id: 7 });
+    dc.onmessage = e => { try { rxRecv(B, JSON.parse(e.data)); } catch (err) {} };
+  } catch (e) {}
   camStream.getTracks().forEach(t => pc.addTrack(t, camStream));
   pc.onicecandidate = e => { if (e.candidate) B.room.send('ice', e.candidate.toJSON()); };
   pc.ontrack = e => {
