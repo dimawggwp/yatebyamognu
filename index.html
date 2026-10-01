@@ -789,6 +789,7 @@ button.launch:active{transform:scale(.995)}
 .side.opp-side{animation-delay:.1s}
 .shot{position:relative;background:var(--s1);border:1px solid var(--line-soft);overflow:hidden;aspect-ratio:3/4;transition:border-color .5s}
 .shot canvas{width:100%;height:100%;object-fit:cover;display:block}
+#cv-me{transform:scaleX(-1)}
 .side.win .shot{border-color:var(--red)}
 .noface{position:absolute;inset:0;display:grid;place-items:center;color:var(--tx3);font-size:.9rem}
 .stamp{position:absolute;top:50%;left:50%;font-family:var(--f-display);font-weight:900;font-size:clamp(1.6rem,3.6vw,2.8rem);color:var(--red-hi);border:4px solid var(--red-hi);padding:4px 16px;transform:translate(-50%,-50%) rotate(-12deg) scale(2.6);opacity:0;letter-spacing:.04em;background:oklch(13.5% 0.012 25 / .4);pointer-events:none;z-index:2}
@@ -922,6 +923,40 @@ button.launch:active{transform:scale(.995)}
 .invite-acts{display:flex;gap:var(--sp-xs)}
 .invite-acts .btn{flex:1}
 @media (max-width:860px){.invites{top:68px;bottom:auto;right:var(--sp-sm);width:calc(100% - 2 * var(--sp-sm))}}
+
+/* ---------- camera toggle ---------- */
+.cam-toggle{position:absolute;top:10px;right:10px;z-index:4;width:36px;height:36px;border-radius:50%;display:grid;place-items:center;color:var(--tx);background:oklch(13.5% 0.012 25 / .55);border:1px solid oklch(100% 0 0 / .1);-webkit-backdrop-filter:blur(12px) saturate(1.4);backdrop-filter:blur(12px) saturate(1.4);opacity:0;transform:scale(.7);pointer-events:none;transition:opacity .3s var(--ease-out),transform .35s var(--ease-out),background .2s,border-color .2s}
+.cam-toggle svg{width:17px;height:17px}
+.cam-toggle:hover{background:var(--red);border-color:var(--red)}
+.cam-toggle:active{transform:scale(.9)!important}
+.cam-slot.on .cam-toggle,.tile.me .cam-toggle{opacity:1;transform:none;pointer-events:auto}
+.tile.me.cam-off .cam-toggle{background:var(--red);border-color:var(--red)}
+.cam-off-ov{position:absolute;inset:0;z-index:2;display:grid;place-content:center;justify-items:center;gap:var(--sp-sm);text-align:center;padding:var(--sp-lg);background:var(--s1);color:var(--tx3);font-size:.85rem;opacity:0;pointer-events:none;transition:opacity .4s var(--ease-out)}
+.cam-off-ov svg{width:22px;height:22px;color:var(--tx2)}
+.tile.cam-off .cam-off-ov{opacity:1}
+
+/* ---------- reactions (iOS) ---------- */
+.rx-wrap{position:relative;display:inline-flex}
+.rx-btn{width:36px;padding:0!important}
+.rx-btn svg{width:18px;height:18px;transition:transform .35s var(--ease-out)}
+.rx-btn[aria-expanded="true"]{border-color:var(--tx3);background:var(--s2)}
+.rx-btn[aria-expanded="true"] svg{transform:rotate(-12deg) scale(1.1)}
+.rx-tray{position:absolute;right:0;bottom:calc(100% + 12px);z-index:5;display:flex;gap:2px;padding:6px;border-radius:999px;background:oklch(24% 0.016 25 / .82);border:1px solid oklch(100% 0 0 / .08);-webkit-backdrop-filter:blur(20px) saturate(1.8);backdrop-filter:blur(20px) saturate(1.8);box-shadow:0 18px 50px -12px rgb(0 0 0 / .7),inset 0 1px 0 oklch(100% 0 0 / .06);transform-origin:calc(100% - 18px) 100%;opacity:0;transform:scale(.5) translateY(10px);pointer-events:none;transition:opacity .2s var(--ease-out),transform .45s cubic-bezier(.34,1.56,.64,1)}
+.rx-tray::after{content:"";position:absolute;right:12px;bottom:-5px;width:12px;height:12px;border-radius:50%;background:inherit;border:inherit}
+.rx-tray.open{opacity:1;transform:none;pointer-events:auto}
+.rx-tray button{width:44px;height:44px;border-radius:50%;display:grid;place-items:center;transition:transform .3s cubic-bezier(.34,1.56,.64,1),background .2s}
+.rx-tray button:hover{transform:translateY(-7px) scale(1.28);background:oklch(100% 0 0 / .06)}
+.rx-tray button:active{transform:scale(.86);transition-duration:.08s}
+.rx-tray.open button{animation:rxIn .5s cubic-bezier(.34,1.56,.64,1) both;animation-delay:calc(var(--i) * 28ms)}
+.rx-tray .rx-e{width:32px;height:32px;font-size:28px;line-height:32px;pointer-events:none}
+@keyframes rxIn{from{opacity:0;transform:translateY(12px) scale(.3)}}
+#rxLayer{position:fixed;inset:0;pointer-events:none;z-index:calc(var(--z-toast) - 1);overflow:hidden}
+.rx-fly{position:fixed;left:0;top:0;will-change:transform,opacity}
+.rx-fly .rx-e{display:block;width:var(--sz);height:var(--sz);font-size:calc(var(--sz) * .86);line-height:var(--sz);text-align:center;filter:drop-shadow(0 6px 14px rgb(0 0 0 / .45));will-change:transform}
+.rx-ring{position:fixed;left:0;top:0;width:90px;height:90px;margin:-45px 0 0 -45px;border-radius:50%;border:2px solid oklch(100% 0 0 / .5);will-change:transform,opacity}
+.rx-spark{position:fixed;left:0;top:0;width:7px;height:7px;margin:-3.5px 0 0 -3.5px;border-radius:50%}
+img.rx-e{-webkit-user-drag:none;user-select:none;object-fit:contain}
+@media (max-width:860px){.rx-tray button{width:38px;height:38px}.rx-tray .rx-e{width:28px;height:28px;font-size:24px;line-height:28px}}
 
 /* ---------- responsive ---------- */
 @media (max-width:1180px){
@@ -1283,6 +1318,13 @@ const EN = {
   'Вызовы не настроены: запусти обновлённый SQL из этого файла в Supabase.': 'Challenges aren’t set up: run the updated SQL from this file in Supabase.',
   'вызвать': 'challenge',
   'Тебя позвали на бой по ссылке. Войди или создай аккаунт, и вызов откроется.': 'You’ve been invited to a battle. Sign in or create an account to accept.',
+  'Выключить камеру': 'Turn camera off',
+  'Камера выключена': 'Camera is off',
+  'Камера выключена: соперник и судья тебя не видят': 'Camera is off: your opponent and the judge can’t see you',
+  'Соперник выключил камеру': 'Opponent turned their camera off',
+  'Сначала отмени поиск': 'Cancel the search first',
+  'Камера недоступна': 'Camera unavailable',
+  'Реакции': 'Reactions',
 };
 
 function tr(s, v) {
@@ -1789,13 +1831,25 @@ const Net = USE_SB ? SupaNet() : DemoNet();
 
 /* =================== camera =================== */
 let camStream = null;
+let camManualOff = sessionStorage.getItem('mog_cam_off') === '1';
 async function ensureCamera() {
+  camManualOff = false; sessionStorage.removeItem('mog_cam_off');
   if (camStream && camStream.getVideoTracks()[0]?.readyState === 'live') return camStream;
   const v = { facingMode: 'user', width: { ideal: 960 }, height: { ideal: 720 } };
   try { camStream = await navigator.mediaDevices.getUserMedia({ video: v, audio: { echoCancellation: true, noiseSuppression: true } }); }
   catch (e) { camStream = await navigator.mediaDevices.getUserMedia({ video: v, audio: false }); }
   updateChecks();
   return camStream;
+}
+/* полностью выключает камеру и микрофон (индикатор браузера гаснет) */
+function stopCamera(manual) {
+  clearTimeout(previewTimer);
+  if (camStream) { camStream.getTracks().forEach(t => { try { t.stop(); } catch (e) {} }); camStream = null; }
+  if (manual) { camManualOff = true; sessionStorage.setItem('mog_cam_off', '1'); }
+  const v = $('#camPrev'); if (v) v.srcObject = null;
+  const c = $('#camFx'); if (c) c.getContext('2d').clearRect(0, 0, c.width, c.height);
+  $('#camSlot')?.classList.remove('on', 'face-ok');
+  S.faceOk = false; updateChecks();
 }
 
 /* =================== face landmarks (MediaPipe) =================== */
@@ -2160,6 +2214,7 @@ function viewArena() {
         <span class="viewfinder"></span>
         <button class="empty" id="camOn" type="button"><i data-lucide="camera"></i><b>${tr('Включить камеру')}</b><span>${tr('Фото не нужно: бой идёт вживую по видео')}</span></button>
         <span class="cam-state" id="camState">${tr('Ищем лицо')}</span>
+        <button class="cam-toggle" id="camOff" type="button" aria-label="${tr('Выключить камеру')}" title="${tr('Выключить камеру')}"><i data-lucide="video-off"></i></button>
       </div>
       <div class="you-name"><h3>${esc(p.display_name)}</h3><span class="mono">${p.elo}</span></div>
       <p class="you-meta">@${esc(p.username)} · ${fac(p.faculty).name}</p>
@@ -2205,14 +2260,16 @@ function viewArena() {
   $$('[data-scope]').forEach(b => b.onclick = () => { if (S.search) return; S.scope = b.dataset.scope; localStorage.setItem('mog_scope', S.scope); $$('[data-scope]').forEach(x => x.setAttribute('aria-pressed', x === b)); SFX.click(); renderLaunch(); });
   $$('[data-ranked]').forEach(b => b.onclick = () => { if (S.search) return; S.ranked = b.dataset.ranked === '1'; localStorage.setItem('mog_ranked', S.ranked ? '1' : '0'); $$('[data-ranked]').forEach(x => x.setAttribute('aria-pressed', x === b)); SFX.click(); renderLaunch(); renderDuel(); });
   $('#camOn').onclick = async () => { try { await ensureCamera(); attachPreview(); } catch (e) { toast(tr('Разреши доступ к камере в настройках браузера'), 'hot', 'camera-off'); } };
+  $('#camOff').onclick = () => { if (S.search) { toast(tr('Сначала отмени поиск')); return; } SFX.click(); stopCamera(true); };
   renderLaunch(); renderDuel(); renderFeed(); updateChecks();
   if (camStream) attachPreview();
-  else navigator.permissions?.query({ name: 'camera' }).then(r => { if (r.state === 'granted') ensureCamera().then(attachPreview).catch(() => {}); }).catch(() => {});
+  else if (!camManualOff) navigator.permissions?.query({ name: 'camera' }).then(r => { if (r.state === 'granted') ensureCamera().then(attachPreview).catch(() => {}); }).catch(() => {});
 }
 
 let previewTimer = null;
 function attachPreview() {
   const v = $('#camPrev'); if (!v || !camStream) return;
+  camStream.getVideoTracks().forEach(t => { t.enabled = true; });
   v.srcObject = camStream; v.play().catch(() => {});
   $('#camSlot').classList.add('on');
   updateChecks(); loadLandmarker().catch(() => {});
@@ -2565,16 +2622,16 @@ function viewBattle() {
       <div class="room-status"><span class="dots" id="pDots"><i class="on"></i><i></i></span><span id="roomStatus">${tr('Ждём соперника · 1/2')}</span></div>
     </div>
     <div class="stage">
-      <figure class="tile me connected" id="tileMe"><video id="vMe" autoplay muted playsinline></video><span class="viewfinder"></span><span class="scan"></span><span class="flash"></span>${cap(me, tr('Ты · ') + fac(me.faculty).short)}</figure>
+      <figure class="tile me connected" id="tileMe"><video id="vMe" autoplay muted playsinline></video><div class="cam-off-ov">${ava(me, 'xl')}<span><i data-lucide="video-off"></i></span><span>${tr('Камера выключена')}</span></div><button class="cam-toggle" id="camBtn" type="button" aria-label="${tr('Выключить камеру')}" title="${tr('Выключить камеру')}"><i data-lucide="video"></i></button><span class="viewfinder"></span><span class="scan"></span><span class="flash"></span>${cap(me, tr('Ты · ') + fac(me.faculty).short)}</figure>
       <div class="mid">
         <div class="ring idle" id="ring"><svg viewBox="0 0 120 120"><circle class="bg" cx="60" cy="60" r="54"/><circle class="fg" id="ringFg" cx="60" cy="60" r="54" stroke-dasharray="339.29" stroke-dashoffset="0" transform="rotate(-90 60 60)"/></svg><b id="tNum">1/2</b></div>
         <p class="mid-label" id="midLabel">${tr('Бой начнётся, когда соперник зайдёт в комнату')}</p>
       </div>
-      <figure class="tile opp" id="tileOpp"><video id="vOpp" autoplay playsinline></video><img id="relayOpp" class="relay-opp" alt=""><div class="tile-wait">${ava(op, 'xl')}<b>${esc(op.display_name)}</b><span id="oppWait">${tr('заходит в комнату…')}</span></div><span class="scan"></span><span class="flash"></span>${cap(op, fac(op.faculty).short)}</figure>
+      <figure class="tile opp" id="tileOpp"><video id="vOpp" autoplay playsinline></video><img id="relayOpp" class="relay-opp" alt=""><div class="cam-off-ov">${ava(op, 'xl')}<span><i data-lucide="video-off"></i></span><span>${tr('Камера выключена')}</span></div><div class="tile-wait">${ava(op, 'xl')}<b>${esc(op.display_name)}</b><span id="oppWait">${tr('заходит в комнату…')}</span></div><span class="scan"></span><span class="flash"></span>${cap(op, fac(op.faculty).short)}</figure>
     </div>
     <div class="battle-foot">
       <span class="tip"><i data-lucide="scan-face"></i>${tr('Лицо целиком в кадре, свет спереди, смотри в объектив')}</span>
-      <div class="controls"><button class="btn sm" id="micBtn"><i data-lucide="mic"></i>${tr('Микрофон')}</button><button class="btn ghost sm" id="leaveBtn">${tr('Выйти')}</button></div>
+      <div class="controls"><span class="rx-wrap"><button class="btn sm rx-btn" id="rxBtn" type="button" aria-label="${tr('Реакции')}" title="${tr('Реакции')}" aria-expanded="false"><i data-lucide="smile-plus"></i></button><div class="rx-tray" id="rxTray" role="menu">${RX.map((r, i) => `<button type="button" data-rx="${r.k}" style="--i:${i}" aria-label="${r.ch}">${rxEmoji(r)}</button>`).join('')}</div></span><button class="btn sm" id="micBtn"><i data-lucide="mic"></i>${tr('Микрофон')}</button><button class="btn ghost sm" id="leaveBtn">${tr('Выйти')}</button></div>
     </div>
   </section>`;
 }
@@ -2603,7 +2660,10 @@ async function enterBattle(m) {
   const B = S.battle = { ...m, meBefore: S.profile.elo, present: 1, remoteOk: false, oppReady: false, started: false, finished: false, timers: [], pendingIce: [], fallbackSet: false };
   lockNav(true); S.view = 'battle'; setNavOn('arena');
   viewBattle(); icons(); renderInvites();
+  camStream?.getVideoTracks().forEach(t => { t.enabled = true; });
   const vMe = $('#vMe'); vMe.srcObject = camStream; vMe.play().catch(() => {});
+  $('#camBtn').onclick = () => setBattleCam(B, !$('#tileMe').classList.contains('cam-off') ? false : true);
+  setupReactions(B);
   $('#leaveBtn').onclick = () => { toast(tr('Ты вышел из комнаты')); abortBattle(B, false); };
   $('#micBtn').onclick = () => {
     const a = camStream?.getAudioTracks()[0]; if (!a) { toast(tr('Микрофон недоступен')); return; }
@@ -2623,6 +2683,15 @@ async function enterBattle(m) {
   room.on('go', () => { if (B.role === 'b') startCountdown(B); });
   room.on('shot', d => { B.oppShot = d; maybeFinish(B); });
   room.on('bye', () => oppLeft(B));
+  room.on('rx', d => { if (S.battle === B && d && RX_MAP[d.k]) rxBurst(d.k, false); });
+  room.on('cam', d => {
+    if (S.battle !== B) return;
+    const off = d && d.on === false;
+    $('#tileOpp')?.classList.toggle('cam-off', off);
+    if (off) toast(tr('Соперник выключил камеру'), '', 'video-off');
+  });
+  const camSync = () => { if ($('#tileMe')?.classList.contains('cam-off')) room.send('cam', { on: false }); };
+  room.on('join', camSync); room.on('here', camSync);
   loadLandmarker().catch(() => {});
   await room.ready;
   if (S.battle !== B) return;
@@ -2667,6 +2736,123 @@ function abortBattle(B, research) {
   try { B.pc?.close(); } catch (e) {}
   S.battle = null; lockNav(false); go('arena');
   if (research) setTimeout(startSearch, 700);
+}
+
+/* =================== camera toggle in battle =================== */
+function setBattleCam(B, on) {
+  const t = camStream?.getVideoTracks()[0];
+  if (!t) { toast(tr('Камера недоступна'), 'hot', 'camera-off'); return; }
+  t.enabled = on;
+  const tile = $('#tileMe'); tile?.classList.toggle('cam-off', !on);
+  const b = $('#camBtn');
+  if (b) { const l = on ? tr('Выключить камеру') : tr('Включить камеру'); b.innerHTML = `<i data-lucide="${on ? 'video' : 'video-off'}"></i>`; b.title = l; b.setAttribute('aria-label', l); icons(); }
+  SFX.click();
+  try { B.room?.send('cam', { on }); } catch (e) {}
+  if (!on) toast(tr('Камера выключена: соперник и судья тебя не видят'), '', 'video-off');
+}
+
+/* =================== reactions (iOS emoji) =================== */
+const RX = [
+  { k: 'love',  ch: '❤️', u: '2764-fe0f' },
+  { k: 'lol',   ch: '😂', u: '1f602' },
+  { k: 'wow',   ch: '😮', u: '1f62e' },
+  { k: 'fire',  ch: '🔥', u: '1f525' },
+  { k: 'like',  ch: '👍', u: '1f44d' },
+  { k: 'dead',  ch: '💀', u: '1f480' },
+  { k: 'mog',   ch: '🗿', u: '1f5ff' },
+];
+const RX_MAP = Object.fromEntries(RX.map(r => [r.k, r]));
+const RX_SRC = r => `https://cdn.jsdelivr.net/npm/emoji-datasource-apple@15.0.1/img/apple/64/${r.u}.png`;
+function rxEmoji(r) {
+  return `<img class="rx-e" src="${RX_SRC(r)}" alt="${r.ch}" draggable="false" onerror="this.outerHTML='<span class=&quot;rx-e&quot;>${r.ch}</span>'">`;
+}
+function rxNode(r) {
+  const img = new Image(); img.className = 'rx-e'; img.alt = r.ch; img.draggable = false;
+  img.onerror = () => { const s = document.createElement('span'); s.className = 'rx-e'; s.textContent = r.ch; img.replaceWith(s); };
+  img.src = RX_SRC(r); return img;
+}
+RX.forEach(r => { const i = new Image(); i.src = RX_SRC(r); });
+
+/* что делает каждый эмодзи, пока летит */
+const RX_ACT = {
+  love: { k: [{ transform: 'scale(1)' }, { transform: 'scale(1.32)', offset: .14 }, { transform: 'scale(.94)', offset: .28 }, { transform: 'scale(1.18)', offset: .42 }, { transform: 'scale(1)' }], o: { duration: 900, iterations: 3, easing: 'ease-out' } },
+  lol:  { k: [{ transform: 'rotate(0) translateY(0)' }, { transform: 'rotate(-16deg) translateY(-3px)' }, { transform: 'rotate(14deg) translateY(2px)' }, { transform: 'rotate(-12deg) translateY(-2px)' }, { transform: 'rotate(10deg)' }, { transform: 'rotate(0)' }], o: { duration: 620, iterations: 4, easing: 'ease-in-out' } },
+  wow:  { k: [{ transform: 'scale(.4)' }, { transform: 'scale(1.5, 1.2)', offset: .25 }, { transform: 'scale(.9, 1.1)', offset: .45 }, { transform: 'scale(1.06, .96)', offset: .65 }, { transform: 'scale(1)' }], o: { duration: 900, easing: 'cubic-bezier(.34,1.56,.64,1)' } },
+  fire: { k: [{ transform: 'scale(1) skewX(0)' }, { transform: 'scale(1.08, 1.18) skewX(-6deg)' }, { transform: 'scale(.96, 1.04) skewX(5deg)' }, { transform: 'scale(1.06, 1.14) skewX(-3deg)' }, { transform: 'scale(1) skewX(0)' }], o: { duration: 420, iterations: 6, easing: 'ease-in-out' } },
+  like: { k: [{ transform: 'rotate(-35deg) scale(.6)' }, { transform: 'rotate(12deg) scale(1.3)', offset: .3 }, { transform: 'rotate(-6deg) scale(1)', offset: .5 }, { transform: 'translateY(-10px) rotate(0) scale(1.1)', offset: .7 }, { transform: 'translateY(0) scale(1)' }], o: { duration: 1100, easing: 'cubic-bezier(.34,1.56,.64,1)' } },
+  dead: { k: [{ transform: 'rotate(0) scale(.6)' }, { transform: 'rotate(380deg) scale(1.2)', offset: .55 }, { transform: 'rotate(350deg) scale(1)', offset: .75 }, { transform: 'rotate(360deg) scale(1)' }], o: { duration: 1300, easing: 'cubic-bezier(.2,.8,.2,1)' } },
+  mog:  { k: [{ transform: 'translateY(-60px) scale(2.4)', opacity: 0 }, { transform: 'translateY(0) scale(1.1)', opacity: 1, offset: .22 }, { transform: 'scale(1.25, .82)', offset: .3 }, { transform: 'scale(.95, 1.06)', offset: .42 }, { transform: 'scale(1)' }], o: { duration: 1200, easing: 'cubic-bezier(.5,0,.2,1)' } },
+};
+const RX_COLOR = { love: '#ff5a7a', lol: '#ffd25a', wow: '#ffd25a', fire: '#ff8a3d', like: '#ffc940', dead: '#d8d8e0', mog: '#b9b1a6' };
+const rxReduce = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+function rxLayer() {
+  let l = $('#rxLayer');
+  if (!l) { l = document.createElement('div'); l.id = 'rxLayer'; l.setAttribute('aria-hidden', 'true'); document.body.appendChild(l); }
+  return l;
+}
+function rxBurst(k, mine) {
+  const r = RX_MAP[k], tile = $(mine ? '#tileMe' : '#tileOpp'); if (!r || !tile) return;
+  const L = rxLayer(); if (L.childElementCount > 60) return;
+  const R = tile.getBoundingClientRect(), reduce = rxReduce();
+  const ox = R.left + R.width * (.3 + Math.random() * .4), oy = R.bottom - Math.min(90, R.height * .18);
+  const n = reduce ? 1 : 3;
+  for (let i = 0; i < n; i++) {
+    const main = i === 0, sz = main ? Math.round(Math.min(78, Math.max(52, R.width * .2))) : Math.round(26 + Math.random() * 12);
+    const el = document.createElement('div'); el.className = 'rx-fly'; el.style.setProperty('--sz', sz + 'px');
+    const e = rxNode(r); el.appendChild(e); L.appendChild(el);
+    const x = ox + (main ? 0 : (i === 1 ? -1 : 1) * (28 + Math.random() * 26)), y = oy + (main ? 0 : 12);
+    const rise = R.height * (main ? .78 : .5 + Math.random() * .25), dr = (Math.random() - .5) * (main ? 70 : 110);
+    const T = (dx, dy, s) => `translate(${x - sz / 2 + dx}px, ${y - sz / 2 + dy}px) scale(${s})`;
+    const dur = reduce ? 1400 : (main ? 2900 : 1900 + Math.random() * 600);
+    const delay = main ? 0 : 90 + i * 70;
+    el.animate(reduce ? [{ transform: T(0, -rise * .3, 1), opacity: 0 }, { opacity: 1, offset: .2 }, { transform: T(0, -rise * .4, 1), opacity: 1, offset: .7 }, { transform: T(0, -rise * .45, 1), opacity: 0 }] : [
+      { transform: T(0, 0, .2), opacity: 0 },
+      { transform: T(dr * .15, -rise * .14, main ? 1.18 : 1), opacity: 1, offset: .14 },
+      { transform: T(-dr * .35, -rise * .42, 1), opacity: 1, offset: .42 },
+      { transform: T(dr * .6, -rise * .72, .96), opacity: 1, offset: .74 },
+      { transform: T(dr, -rise, .7), opacity: 0 },
+    ], { duration: dur, delay, easing: 'cubic-bezier(.22,.7,.3,1)', fill: 'both' }).onfinish = () => el.remove();
+    if (main && !reduce) {
+      const a = RX_ACT[k]; e.animate(a.k, { ...a.o, delay: 120 });
+    }
+  }
+  if (reduce) return;
+  // мягкое кольцо-всплеск в точке старта
+  const ring = document.createElement('div'); ring.className = 'rx-ring'; ring.style.borderColor = RX_COLOR[k]; L.appendChild(ring);
+  ring.animate([{ transform: `translate(${ox}px, ${oy}px) scale(.2)`, opacity: .9 }, { transform: `translate(${ox}px, ${oy}px) scale(1.6)`, opacity: 0 }], { duration: 650, easing: 'cubic-bezier(.16,1,.3,1)', fill: 'both' }).onfinish = () => ring.remove();
+  // искры
+  const sparks = k === 'fire' ? 14 : k === 'love' ? 10 : 7;
+  for (let i = 0; i < sparks; i++) {
+    const p = document.createElement('div'); p.className = 'rx-spark'; p.style.background = RX_COLOR[k]; L.appendChild(p);
+    const ang = k === 'fire' ? -Math.PI / 2 + (Math.random() - .5) * 1.4 : Math.random() * Math.PI * 2;
+    const dist = 40 + Math.random() * 60, dx = Math.cos(ang) * dist, dy = Math.sin(ang) * dist - (k === 'fire' ? 40 : 10);
+    p.animate([{ transform: `translate(${ox}px, ${oy}px) scale(1)`, opacity: 1 }, { transform: `translate(${ox + dx}px, ${oy + dy}px) scale(.2)`, opacity: 0 }], { duration: 600 + Math.random() * 500, delay: 60, easing: 'cubic-bezier(.16,1,.3,1)', fill: 'both' }).onfinish = () => p.remove();
+  }
+  // 🗿 «приземляется» с тяжёлым ударом, 😂 трясёт кадр от смеха
+  if (k === 'mog') setTimeout(() => tile.animate([{ transform: 'none' }, { transform: 'translateY(5px) scale(.992)' }, { transform: 'translateY(-2px)' }, { transform: 'none' }], { duration: 320, easing: 'ease-out' }), 280);
+  if (k === 'lol') tile.animate([{ transform: 'none' }, { transform: 'rotate(-.6deg)' }, { transform: 'rotate(.6deg)' }, { transform: 'none' }], { duration: 300, iterations: 2 });
+  if (k === 'love') tile.animate([{ boxShadow: '0 0 0 0 rgba(255,90,122,0)' }, { boxShadow: '0 0 0 3px rgba(255,90,122,.55), 0 0 40px rgba(255,90,122,.35)' }, { boxShadow: '0 0 0 0 rgba(255,90,122,0)' }], { duration: 900 });
+}
+function setupReactions(B) {
+  const btn = $('#rxBtn'), tray = $('#rxTray'); if (!btn || !tray) return;
+  let last = 0;
+  const open = v => { tray.classList.toggle('open', v); btn.setAttribute('aria-expanded', v); };
+  btn.onclick = e => { e.stopPropagation(); open(!tray.classList.contains('open')); SFX.click(); };
+  tray.onclick = e => {
+    const b = e.target.closest('[data-rx]'); if (!b) return;
+    e.stopPropagation();
+    const now = Date.now(); if (now - last < 260) return; last = now;
+    const k = b.dataset.rx;
+    b.animate([{ transform: 'scale(.8)' }, { transform: 'scale(1.35)' }, { transform: 'scale(1)' }], { duration: 380, easing: 'cubic-bezier(.34,1.56,.64,1)' });
+    rxBurst(k, true);
+    try { B.room?.send('rx', { k }); } catch (err) {}
+  };
+  const close = e => {
+    if (S.battle !== B || !document.body.contains(tray)) { document.removeEventListener('click', close); document.removeEventListener('keydown', esc); return; }
+    if (!e.target.closest?.('.rx-wrap')) open(false);
+  };
+  const esc = e => { if (e.key === 'Escape' && tray.classList.contains('open')) { e.stopPropagation(); open(false); } };
+  document.addEventListener('click', close); document.addEventListener('keydown', esc);
 }
 
 /* WebRTC */
@@ -3122,6 +3308,14 @@ document.addEventListener('keydown', e => {
   }
   if (S.view === 'result' && (e.key.toLowerCase() === 'r' || e.key.toLowerCase() === 'к')) again();
 });
+/* ушёл с сайта или свернул вкладку: камера сразу гаснет */
+addEventListener('pagehide', () => stopCamera());
+addEventListener('pageshow', e => { if (e.persisted && S.view === 'arena' && !camManualOff && !camStream) ensureCamera().then(attachPreview).catch(() => {}); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { if (!S.battle && !S.search) stopCamera(); }
+  else if (S.view === 'arena' && !camManualOff && !camStream)
+    navigator.permissions?.query({ name: 'camera' }).then(r => { if (r.state === 'granted') ensureCamera().then(attachPreview).catch(() => {}); }).catch(() => {});
+});
 addEventListener('beforeunload', () => {
   if (S.duel && USE_SB && sb) sb.rpc('decline_challenge', { p_id: S.duel.id }).catch(() => {});
   try { S.battle?.room?.send('bye', {}); S.battle?.room?.leave(); } catch (e) {}
@@ -3129,6 +3323,7 @@ addEventListener('beforeunload', () => {
     S.search.ac.abort();
     if (USE_SB && sb) sb.rpc('cancel_queue').catch(() => {});
   }
+  stopCamera();
 });
 
 boot();
