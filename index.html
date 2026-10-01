@@ -86,7 +86,7 @@
 <!-- /skill:libraries -->
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>FACEMATCH · Arena</title>
+<title>FACE2MOG · Arena</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@600;800;900&family=Onest:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
@@ -348,7 +348,7 @@ begin
 end $$;
 
 -- =====================================================================
--- ---------- вызовы и приглашения (FACEMATCH: бой с другом) ----------
+-- ---------- вызовы и приглашения (FACE2MOG: бой с другом) ----------
 -- Только добавляет новое: таблицу challenges и 4 функции. Старые таблицы,
 -- ELO, профили и история не трогаются. Можно запускать повторно.
 -- =====================================================================
@@ -1256,7 +1256,7 @@ const EN = {
   'Поделиться': 'Share',
   'Отменить вызов': 'Cancel challenge',
   'Не закрывай вкладку: бой начнётся сам, как только друг примет': 'Keep this tab open: the battle starts as soon as your friend accepts',
-  'Го в FACEMATCH 1 на 1': 'Face me 1v1 on FACEMATCH',
+  'Го в FACE2MOG 1 на 1': 'Face me 1v1 on FACE2MOG',
   'Ссылка скопирована. Скинь её другу': 'Link copied. Send it to your friend',
   'Скопируй ссылку вручную': 'Copy the link manually',
   'Бой с другом работает только с подключённой базой Supabase': 'Friend battles need a connected Supabase database',
@@ -1296,7 +1296,7 @@ function i18nProps(arr, keys) {
   arr.forEach(o => keys.forEach(k => { const raw = o[k]; Object.defineProperty(o, k, { get: () => tr(raw), enumerable: true, configurable: true }); }));
   return arr;
 }
-function applyLangMeta() { document.documentElement.lang = LANG; document.title = 'FACEMATCH · ' + tr('Арена'); }
+function applyLangMeta() { document.documentElement.lang = LANG; document.title = 'FACE2MOG · ' + tr('Арена'); }
 applyLangMeta();
 const langBtnHTML = id => `<button class="lang" type="button" id="${id}" aria-label="Language / Язык"><i data-lucide="languages"></i>${LANG.toUpperCase()}</button>`;
 function setLang(l) {
@@ -2006,7 +2006,7 @@ function renderAuth() {
   $('#app').innerHTML = `<div class="auth">
     <section class="auth-poster">
       <div class="poster-grid"></div>
-      <div class="brand"><span class="brand-mark"></span>FACEMATCH<span class="brand-sub">${tr('Арена')}</span></div>
+      <div class="brand"><span class="brand-mark"></span>FACE2MOG<span class="brand-sub">${tr('Арена')}</span></div>
       <h2 class="poster-title"><span>MOG</span><span class="outline">OR GET</span><span>MOGGED</span></h2>
       <div class="poster-rules">
         <div><b>${tr('8 с')}</b><span>${tr('скан лица')}</span></div>
@@ -2105,7 +2105,7 @@ async function verifyCode(btn) {
 function renderShell() {
   $('#app').innerHTML = `
   <header class="top">
-    <div class="brand"><span class="brand-mark"></span>FACEMATCH<span class="brand-sub">${tr('Арена')}</span></div>
+    <div class="brand"><span class="brand-mark"></span>FACE2MOG<span class="brand-sub">${tr('Арена')}</span></div>
     <nav class="nav" aria-label="${tr('Разделы')}">
       <a data-go="arena"><i data-lucide="swords" class="ni"></i><span>${tr('Арена')}</span><span class="kbd">1</span></a>
       <a data-go="board"><i data-lucide="trophy" class="ni"></i><span>${tr('Рейтинг')}</span><span class="kbd">2</span></a>
@@ -2389,7 +2389,7 @@ function renderDuel() {
     </div>`;
     $('#duoCancel').onclick = () => cancelDuel(true);
     const cp = $('#duoCopy'); if (cp) cp.onclick = () => copyInvite(D);
-    const sh = $('#duoShare'); if (sh) sh.onclick = () => navigator.share({ title: 'FACEMATCH', text: tr('Го в FACEMATCH 1 на 1'), url: inviteLink(D.code) }).catch(() => {});
+    const sh = $('#duoShare'); if (sh) sh.onclick = () => navigator.share({ title: 'FACE2MOG', text: tr('Го в FACE2MOG 1 на 1'), url: inviteLink(D.code) }).catch(() => {});
     const u = $('#duoUrl'); if (u) u.onfocus = () => u.select();
   }
   icons();
